@@ -36,8 +36,8 @@
         }
     },
     "train": {
-        "data": "path to hdf5 goes here",
-        "output_dir": "../bc_trained_models",
+        "data": "C:/Users/sa-forest/Documents/GitHub/robomimic/data/initial_train_dataset.hdf5",
+        "output_dir": "../bc_patcherBot_trained_models",
         "num_data_workers": 4,
         "hdf5_cache_mode": "all",
         "hdf5_use_swmr": true,
@@ -56,8 +56,8 @@
         ],
         "goal_mode": null,
         "cuda": true,
-        "batch_size": 64,
-        "num_epochs": 2000,
+        "batch_size": 128,
+        "num_epochs": 50,
         "seed": 1
     },
     "algo": {

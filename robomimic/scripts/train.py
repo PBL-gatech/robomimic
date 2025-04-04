@@ -68,18 +68,21 @@ def train(config, device):
     ObsUtils.initialize_obs_utils_with_config(config)
 
     # make sure the dataset exists
+    print(f"given path is: {config.train.data}")
     dataset_path = os.path.expanduser(config.train.data)
     if not os.path.exists(dataset_path):
         raise Exception("Dataset at provided path {} not found!".format(dataset_path))
 
     # load basic metadata from training file
     print("\n============= Loaded Environment Metadata =============")
-    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=config.train.data)
+    env_meta = None
+    # env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=config.train.data)
     shape_meta = FileUtils.get_shape_metadata_from_dataset(
         dataset_path=config.train.data,
         all_obs_keys=config.all_obs_keys,
         verbose=True
     )
+    print(f"testing shape_meta: {shape_meta}")
 
     if config.experiment.env is not None:
         env_meta["env_name"] = config.experiment.env
@@ -331,6 +334,7 @@ def train(config, device):
 
 def main(args):
 
+
     if args.config is not None:
         ext_cfg = json.load(open(args.config, 'r'))
         config = config_factory(ext_cfg["algo_name"])
@@ -349,6 +353,7 @@ def main(args):
 
     # get torch device
     device = TorchUtils.get_torch_device(try_to_use_cuda=config.train.cuda)
+    print("Using device: {}".format(device))
 
     # maybe modify config for debugging purposes
     if args.debug:
@@ -388,7 +393,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default=None,
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\bc-PatcherBot.json",
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
     )
