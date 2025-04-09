@@ -124,3 +124,7 @@ venv.bak/
 # private macros
 macros_private.py
 /data
+/bc_patcherBot_trained_models
+/bc_patcherBot_trained_models_HEK
+/bc_patcherBot_trained_models_HEK_fullStage
+/bc_patcherBot_trained_models_restart
