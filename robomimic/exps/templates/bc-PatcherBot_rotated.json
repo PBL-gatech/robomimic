@@ -1,7 +1,7 @@
 {
     "algo_name": "bc",
     "experiment": {
-        "name": "clean",
+        "name": "rotated",
         "validate": true,
         "logging": {
             "terminal_output_to_txt": true,
@@ -36,8 +36,8 @@
         }
     },
     "train": {
-        "data": "C:/Users/sa-forest/Documents/GitHub/robomimic/data/HEK_dataset_2.hdf5",
-        "output_dir": "../bc_patcherBot_trained_models_HEK_2",
+        "data": "C:/Users/sa-forest/Documents/GitHub/robomimic/data/HEK_dataset_rotated.hdf5",
+        "output_dir": "../bc_patcherBot_trained_models_HEK_rotated",
         "num_data_workers": 4,
         "hdf5_cache_mode": "all",
         "hdf5_use_swmr": true,
@@ -56,7 +56,7 @@
         ],
         "goal_mode": null,
         "cuda": true,
-        "batch_size": 64,
+        "batch_size": 32,
         "num_epochs": 500,
         "seed": 1
     },
