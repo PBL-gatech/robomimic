@@ -98,11 +98,11 @@ if __name__ == "__main__":
     #     help="validation ratio, in (0, 1)"
     # )
     # args = parser.parse_args()
-    dataset = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\HEK_dataset_v0_013.hdf5"  # replace with your dataset path
+    dataset = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\HEK_dataset_v0_015.hdf5"  # replace with your dataset path
     filter_key = None  # replace with your filter key if needed
     ratio = 0.1  # default validation ratio
     # seed to make sure results are consistent
-    np.random.seed(42)
+    np.random.seed(0)
 
     # split_train_val_from_hdf5(args.dataset, val_ratio=args.ratio, filter_key=args.filter_key)
     split_train_val_from_hdf5(dataset, val_ratio=ratio, filter_key=filter_key)
