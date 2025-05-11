@@ -127,7 +127,7 @@ def wrap_policy(policy, config):
     else:
         raise AttributeError("Could not locate obs_shapes on policy. Check your Robomimic version.")
 
-    obs_keys = list(obs_shapes.keys())
+    obs_keys = list(obs_shapes.keys())               # order of observations expected by wrapper    
 
     # use config to determine recurrence
     is_recurrent = bool(config["algo"]["rnn"]["enabled"])
@@ -169,13 +169,17 @@ def wrap_policy(policy, config):
     return wrapper, obs_keys, is_recurrent
 
 def create_dummy_inputs(wrapper, obs_keys, is_recurrent, config):
-    # build zero tensors for each observation key
-    batch = 1                                   # keep batch fixed at export
-    # use the exact sequence length Robomimic fed the network during training
-    seq   = int(config["train"].get("seq_length", 1))
+    """
+    Build fixed-size zero tensors for export.  All dimensions—including batch
+    and sequence length—are constant, so OpenCV DNN will load the file.
+    """
+    import torch
+
+    batch = 1                                           # fixed
+    seq   = int(config["train"].get("seq_length", 1))   # fixed
 
     dummy_inputs = [
-        torch.zeros((batch, seq, *wrapper.obs_shapes[k]), dtype=torch.float32)  # (B, T, …)
+        torch.zeros((batch, seq, *wrapper.obs_shapes[k]), dtype=torch.float32)
         for k in obs_keys
     ]
 
@@ -186,31 +190,38 @@ def create_dummy_inputs(wrapper, obs_keys, is_recurrent, config):
             torch.zeros((num_layers, batch, hidden_size), dtype=torch.float32),  # h0
             torch.zeros((num_layers, batch, hidden_size), dtype=torch.float32)   # c0
         ]
+
     input_names  = obs_keys + (['h0', 'c0'] if is_recurrent else [])
     output_names = ['actions'] + (['h1', 'c1'] if is_recurrent else [])
 
-    # dynamic axes: batch flexible; sequence length fixed at export but
-    #               *optional* to make dynamic – uncomment next line if desired
-    dyn_axes = {n: {0: 'batch', 1: 'seq'} for n in input_names + output_names}
+    dyn_axes = None          # <--- turn off dynamic axes completely
 
-    print("[*] Created dummy inputs and I/O metadata for ONNX")
+    print("[*] Created dummy inputs with fully-static shapes")
     return dummy_inputs, input_names, output_names, dyn_axes
 
 
 def export_to_onnx(wrapper, dummy_inputs, input_names, output_names, dyn_axes, onnx_path):
-    print(f"[*] Exporting to {onnx_path}")
-    torch.onnx.export(
-        wrapper,
-        tuple(dummy_inputs),
-        onnx_path.as_posix(),
-        opset_version=17,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dyn_axes,
-        do_constant_folding=True
-    )
-    print("[✓] ONNX export complete and file written")
+    """
+    Export the wrapper network to a fully-static ONNX file.
+    """
+    import torch
 
+    export_kwargs = dict(
+        model             = wrapper,
+        args              = tuple(dummy_inputs),
+        f                 = onnx_path.as_posix(),
+        opset_version     = 17,
+        input_names       = input_names,
+        output_names      = output_names,
+        do_constant_folding = True,
+    )
+    # Only pass dynamic_axes if they are defined
+    if dyn_axes is not None:
+        export_kwargs["dynamic_axes"] = dyn_axes
+
+    print(f"[*] Exporting static-shape ONNX to {onnx_path}")
+    torch.onnx.export(**export_kwargs)
+    print("[✓] ONNX export complete")
 
 def main():
     args = parse_args()
