@@ -67,6 +67,7 @@ import h5py
 import argparse
 import imageio
 import numpy as np
+import random
 
 import robomimic
 import robomimic.utils.obs_utils as ObsUtils
@@ -119,7 +120,10 @@ def playback_trajectory_with_env(
     assert not (render and write_video)
 
     # load the initial state
-    env.reset()
+    ## this reset call doesn't seem necessary.
+    ## seems ok to remove but haven't fully tested it.
+    ## removing for now
+    # env.reset()
     env.reset_to(initial_state)
 
     traj_len = states.shape[0]
@@ -251,9 +255,10 @@ def playback_dataset(args):
         demos = list(f["data"].keys())
     inds = np.argsort([int(elem[5:]) for elem in demos])
     demos = [demos[i] for i in inds]
-
+    
     # maybe reduce the number of demonstrations to playback
     if args.n is not None:
+        random.shuffle(demos)
         demos = demos[:args.n]
 
     # maybe dump video
@@ -281,6 +286,7 @@ def playback_dataset(args):
         initial_state = dict(states=states[0])
         if is_robosuite_env:
             initial_state["model"] = f["data/{}".format(ep)].attrs["model_file"]
+            initial_state["ep_meta"] = f["data/{}".format(ep)].attrs.get("ep_meta", None)
 
         # supply actions if using open-loop action playback
         actions = None

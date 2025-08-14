@@ -19,8 +19,19 @@ try:
     import mimicgen_envs
 except ImportError:
     pass
+try:
+    # this is needed for ensuring robosuite can find the additional robocasa environments (see https://robocasa.ai)
+    import robocasa
+except ImportError:
+    pass
+try:
+    # try to import mimiclabs envs
+    from mimiclabs.mimiclabs.envs import *
+except ImportError:
+    pass
 
 import robomimic.utils.obs_utils as ObsUtils
+import robomimic.utils.lang_utils as LangUtils
 import robomimic.envs.env_base as EB
 
 # protect against missing mujoco-py module, since robosuite might be using mujoco-py or DM backend
@@ -40,7 +51,7 @@ class EnvRobosuite(EB.EnvBase):
         render_offscreen=False, 
         use_image_obs=False, 
         use_depth_obs=False, 
-        postprocess_visual_obs=True, 
+        lang=None,
         **kwargs,
     ):
         """
@@ -61,11 +72,8 @@ class EnvRobosuite(EB.EnvBase):
                 on every env.step call. Set this to False for efficiency reasons, if depth
                 observations are not required.
 
-            postprocess_visual_obs (bool): if True, postprocess image observations
-                to prepare for learning. This should only be False when extracting observations
-                for saving to a dataset (to save space on RGB images for example).
+            lang: language descripton for the environment
         """
-        self.postprocess_visual_obs = postprocess_visual_obs
         self.use_depth_obs = use_depth_obs
 
         # robosuite version check
@@ -84,6 +92,8 @@ class EnvRobosuite(EB.EnvBase):
             use_camera_obs=use_image_obs,
             camera_depths=use_depth_obs,
         )
+        if render and self.is_v15_or_higher:
+            update_kwargs["renderer"] = "mujoco"
         kwargs.update(update_kwargs)
 
         if self._is_v1:
@@ -101,8 +111,11 @@ class EnvRobosuite(EB.EnvBase):
             kwargs["camera_depth"] = use_depth_obs # rename kwarg
 
         self._env_name = env_name
+
         self._init_kwargs = deepcopy(kwargs)
         self.env = robosuite.make(self._env_name, **kwargs)
+        self.lang = lang
+        self._lang_emb = LangUtils.get_lang_emb(self.lang)
 
         if self._is_v1:
             # Make sure joint position observations and eef vel observations are active
@@ -125,17 +138,26 @@ class EnvRobosuite(EB.EnvBase):
         """
         obs, r, done, info = self.env.step(action)
         obs = self.get_observation(obs)
+        info["is_success"] = self.is_success()
         return obs, r, self.is_done(), info
 
-    def reset(self):
+    def reset(self, unset_ep_meta=True):
         """
         Reset environment.
 
+        Args:
+            unset_ep_meta (np.array): whether to reset any previously set episode metadata (otherwise
+                will continue to use previous episode metadata)
+        
         Returns:
             observation (dict): initial observation dictionary.
         """
+        if unset_ep_meta and self.is_v15_or_higher:
+            # unset the ep meta to clear out any ep meta that was previously set
+            # (this feature was set from robosuite v1.5 onwards)
+            self.env.unset_ep_meta()
         di = self.env.reset()
-        return self.get_observation(di)
+        return self.get_observation(di)        
 
     def reset_to(self, state):
         """
@@ -152,7 +174,18 @@ class EnvRobosuite(EB.EnvBase):
         """
         should_ret = False
         if "model" in state:
-            self.reset()
+            if state.get("ep_meta", None) is not None:
+                # set relevant episode information
+                ep_meta = json.loads(state["ep_meta"])
+            else:
+                ep_meta = {}
+
+            if self.is_v15_or_higher: # newer versions of robosuite have this feature
+                self.env.set_ep_meta(ep_meta)
+            # this reset is necessary.
+            # while the call to env.reset_from_xml_string does call reset,
+            # that is only a "soft" reset that doesn't actually reload the model.
+            self.reset(unset_ep_meta=False)
             robosuite_version_id = int(robosuite.__version__.split(".")[1])
             if robosuite_version_id <= 3:
                 from robosuite.utils.mjcf_utils import postprocess_model_xml
@@ -178,7 +211,7 @@ class EnvRobosuite(EB.EnvBase):
             return self.get_observation()
         return None
 
-    def render(self, mode="human", height=None, width=None, camera_name="agentview"):
+    def render(self, mode="human", height=None, width=None, camera_name=None):
         """
         Render from simulation to either an on-screen window or off-screen to RGB array.
 
@@ -188,15 +221,19 @@ class EnvRobosuite(EB.EnvBase):
             width (int): width of image to render - only used if mode is "rgb_array"
             camera_name (str): camera name to use for rendering
         """
+        # if camera_name is None, infer from initial env kwargs
+        if camera_name is None:
+            camera_name = sorted(self._init_kwargs.get("camera_names", ["agentview"]))[0]
+
         if mode == "human":
             cam_id = self.env.sim.model.camera_name2id(camera_name)
             self.env.viewer.set_camera(cam_id)
             return self.env.render()
         elif mode == "rgb_array":
             im = self.env.sim.render(height=height, width=width, camera_name=camera_name)
-            if self.use_depth_obs:
-                # render() returns a tuple when self.use_depth_obs=True
-                return im[0][::-1]
+            # if self.use_depth_obs:
+            #     # render() returns a tuple when self.use_depth_obs=True
+            #     return im[0][::-1]
             return im[::-1]
         else:
             raise NotImplementedError("mode={} is not implemented".format(mode))
@@ -215,19 +252,15 @@ class EnvRobosuite(EB.EnvBase):
         for k in di:
             if (k in ObsUtils.OBS_KEYS_TO_MODALITIES) and ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb"):
                 # by default images from mujoco are flipped in height
-                ret[k] = di[k][::-1]
-                if self.postprocess_visual_obs:
-                    ret[k] = ObsUtils.process_obs(obs=ret[k], obs_key=k)
+                ret[k] = di[k][::-1].copy()
             elif (k in ObsUtils.OBS_KEYS_TO_MODALITIES) and ObsUtils.key_is_obs_modality(key=k, obs_modality="depth"):
                 # by default depth images from mujoco are flipped in height
-                ret[k] = di[k][::-1]
+                ret[k] = di[k][::-1].copy()
                 if len(ret[k].shape) == 2:
                     ret[k] = ret[k][..., None] # (H, W, 1)
                 assert len(ret[k].shape) == 3 
                 # scale entries in depth map to correspond to real distance.
                 ret[k] = self.get_real_depth_map(ret[k])
-                if self.postprocess_visual_obs:
-                    ret[k] = ObsUtils.process_obs(obs=ret[k], obs_key=k)
 
         # "object" key contains object information
         ret["object"] = np.array(di["object-state"])
@@ -247,6 +280,9 @@ class EnvRobosuite(EB.EnvBase):
             ret["eef_pos"] = np.array(di["eef_pos"])
             ret["eef_quat"] = np.array(di["eef_quat"])
             ret["gripper_qpos"] = np.array(di["gripper_qpos"])
+
+        if self._lang_emb is not None:
+            ret[LangUtils.LANG_EMB_OBS_KEY] = np.array(self._lang_emb)
         return ret
 
     def get_real_depth_map(self, depth_map):
@@ -329,7 +365,11 @@ class EnvRobosuite(EB.EnvBase):
         """
         xml = self.env.sim.model.get_xml() # model xml file
         state = np.array(self.env.sim.get_state().flatten()) # simulator state
-        return dict(model=xml, states=state)
+        info = dict(model=xml, states=state)
+        if self.is_v15_or_higher:
+            # get ep_meta if applicable for newer versions of robosuite
+            info["ep_meta"] = json.dumps(self.env.get_ep_meta(), indent=4)
+        return info
 
     def get_reward(self):
         """
@@ -391,6 +431,15 @@ class EnvRobosuite(EB.EnvBase):
         """
         return EB.EnvType.ROBOSUITE_TYPE
 
+    @property
+    def is_v15_or_higher(self):
+        """
+        Returns true if the robosuite version is v1.5.0+
+        """
+        main_version = int(robosuite.__version__.split(".")[0])
+        sub_version = int(robosuite.__version__.split(".")[1])
+        return (main_version > 1) or (main_version == 1 and sub_version >= 5)
+    
     @property
     def version(self):
         """
@@ -485,14 +534,12 @@ class EnvRobosuite(EB.EnvBase):
             obs_modality_specs["obs"]["depth"] = depth_modalities
         ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs)
 
-        # note that @postprocess_visual_obs is False since this env's images will be written to a dataset
         return cls(
             env_name=env_name,
             render=(False if render is None else render), 
             render_offscreen=(has_camera if render_offscreen is None else render_offscreen), 
             use_image_obs=(has_camera if use_image_obs is None else use_image_obs), 
             use_depth_obs=use_depth_obs,
-            postprocess_visual_obs=False,
             **kwargs,
         )
 
