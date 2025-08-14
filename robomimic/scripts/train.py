@@ -79,13 +79,15 @@ def train(config, device, resume=False):
         with config.values_unlocked():
             config.train.data = [{"path": config.train.data}]
     for dataset_cfg in config.train.data:
+        print(f"given path is: {config.train.data}")
         dataset_path = os.path.expanduser(dataset_cfg["path"])
         if not os.path.exists(dataset_path):
             raise Exception("Dataset at provided path {} not found!".format(dataset_path))
 
         # load basic metadata from training file
         print("\n============= Loaded Environment Metadata =============")
-        env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=dataset_path)
+        env_meta = None
+    # env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=dataset_path)
 
         # populate language instruction for env in env_meta
         env_meta["lang"] = dataset_cfg.get("lang", "dummy")
@@ -102,6 +104,7 @@ def train(config, device, resume=False):
             verbose=True
         )
         shape_meta_list.append(shape_meta)
+    print(f"testing shape_meta: {shape_meta}")
 
     if config.experiment.env is not None:
         # if an environment name is specified, just use this env using the first dataset's metadata
@@ -457,6 +460,7 @@ def train(config, device, resume=False):
 
 def main(args):
 
+
     if args.config is not None:
         ext_cfg = json.load(open(args.config, 'r'))
         config = config_factory(ext_cfg["algo_name"])
@@ -475,6 +479,7 @@ def main(args):
 
     # get torch device
     device = TorchUtils.get_torch_device(try_to_use_cuda=config.train.cuda)
+    print("Using device: {}".format(device))
 
     # maybe modify config for debugging purposes
     if args.debug:
@@ -514,7 +519,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default=None,
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\bc-PatcherBot_v0_022.json",
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
     )

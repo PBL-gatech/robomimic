@@ -49,8 +49,10 @@ def get_torch_device(try_to_use_cuda):
     if try_to_use_cuda and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         device = torch.device("cuda:0")
+        print("Using GPU: {} for training".format(torch.cuda.get_device_name(0)))
     else:
         device = torch.device("cpu")
+        print(f"cpu only mode: {torch.cuda.is_available()} - using CPU for training")
     return device
 
 
