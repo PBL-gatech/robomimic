@@ -15,7 +15,7 @@ from robomimic.utils.file_utils import policy_from_checkpoint
 
 # Default folder used when no CLI args are provided (pointing to repo root)
 
-DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot_trained_models_HEK_v0_021' / 'v0_021' / '20250527191420'
+DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot_trained_models_HEK_v0_024' / 'v0_024' / '20250603001409'
 
 
 def parse_args():
