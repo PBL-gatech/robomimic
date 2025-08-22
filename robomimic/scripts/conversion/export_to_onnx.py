@@ -11,11 +11,12 @@ Usage (example):
 """
 import argparse, torch, json, pathlib, glob, re
 from robomimic.utils.file_utils import policy_from_checkpoint
+from robomimic.utils import obs_utils as ObsUtils
 
 
 # Default folder used when no CLI args are provided (pointing to repo root)
 
-DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot_trained_models_HEK_v0_024' / 'v0_024' / '20250603001409'
+DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'training' /'bc_patcherBot_trained_models_HEK_v0_024' / 'v0_024' / '20250603001409'
 
 
 def parse_args():
@@ -50,14 +51,14 @@ def find_paths(folder):
 
 def load_policy(ckpt_path, device):
     print(f"[*] Loading policy from checkpoint {ckpt_path}")
-    policy, dict = policy_from_checkpoint(
+    policy, ckpt_dict = policy_from_checkpoint(
         ckpt_path = ckpt_path,
         device=torch.device(device),
         verbose=False
     )
     
     print("[*] Policy loaded")
-    return policy
+    return policy, ckpt_dict
 
 
 def inspect_policy(ckpt_path, device):
@@ -90,6 +91,71 @@ def load_config(config_path):
     print("[load_config] obs modalities:", cfg["observation"]["modalities"]["obs"])
     print("[load_config] rnn settings:", cfg["algo"]["rnn"])
     return cfg
+
+
+# ----------------------------
+# Normalization stats (actions)
+# ----------------------------
+
+def _to_1d_np(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    import numpy as np
+    return np.asarray(x, dtype=np.float32).reshape(-1)
+
+
+def extract_action_normalization(ckpt_dict):
+    """
+    Build action normalization dict compatible with ObsUtils.unnormalize_dict.
+    Returns {"actions": {"offset": torch.Tensor(1,1,D), "scale": torch.Tensor(1,1,D)}} or None.
+    Accepts offset/scale or mean/std.
+    """
+    # common locations across forks
+    candidates = [
+        ("normalization_stats", "actions"),
+        ("action_normalization_stats", None),
+        ("stats", "actions"),
+        ("normalization", "actions"),
+    ]
+
+    stats = None
+    for top, sub in candidates:
+        node = ckpt_dict.get(top)
+        if node is None:
+            continue
+        if sub is None and isinstance(node, dict):
+            stats = node
+        elif sub is not None and isinstance(node, dict):
+            stats = node.get(sub)
+        if stats is not None:
+            break
+
+    # rare: directly at top level
+    if stats is None and isinstance(ckpt_dict, dict):
+        if all(k in ckpt_dict for k in ("offset", "scale")) or all(k in ckpt_dict for k in ("mean", "std")):
+            stats = ckpt_dict
+
+    if stats is None or not isinstance(stats, dict):
+        print("[extract_action_normalization] No action normalization stats found")
+        return None
+
+    if "offset" in stats and "scale" in stats:
+        offset, scale = stats["offset"], stats["scale"]
+    elif "mean" in stats and "std" in stats:
+        offset, scale = stats["mean"], stats["std"]
+    else:
+        print("[extract_action_normalization] Missing offset/scale or mean/std")
+        return None
+
+    offset = _to_1d_np(offset)
+    scale  = _to_1d_np(scale)
+    D = int(offset.shape[0])
+
+    import numpy as np
+    offset_t = torch.from_numpy(offset).view(1, 1, D)
+    scale_t  = torch.from_numpy(scale).view(1, 1, D)
+
+    return {"actions": {"offset": offset_t, "scale": scale_t}}
 
 
 def wrap_policy(policy, config):
@@ -146,6 +212,26 @@ def wrap_policy(policy, config):
             self.obs_shapes   = obs_shapes
             self.rnn        = getattr(actor_net, "rnn", None)
 
+            # Action unnormalization parameters (registered as buffers → baked into ONNX)
+            # We fetch them from the outer scope via closure at construction time.
+            self.act_offset = None
+            self.act_scale  = None
+
+        @staticmethod
+        def _extract_actions(actions):
+            if isinstance(actions, dict):
+                return actions.get("actions", next(iter(actions.values())))
+            return actions
+
+        def _unnormalize_actions(self, actions):
+            # Use robomimic's own utility for inverse normalization when buffers are present
+            if (self.act_offset is None) or (self.act_scale is None):
+                return actions
+            adict = {"actions": actions}
+            stats = {"actions": {"offset": self.act_offset, "scale": self.act_scale}}
+            ObsUtils.unnormalize_dict(adict, stats)  # in-place
+            return adict["actions"]
+
         def forward(self, *tensors):
             # Split the incoming *args* into observation tensors and, if
             # recurrent, hidden state (h0, c0)
@@ -157,19 +243,23 @@ def wrap_policy(policy, config):
                 actions, (h1, c1) = self.actor_net(obs_dict,
                                                    rnn_init_state=(h0, c0),
                                                    return_state=True)
+                actions = self._extract_actions(actions)
+                actions = self._unnormalize_actions(actions)
                 return actions, h1, c1
             else:
                 actions = self.actor_net(obs_dict)
                 # Some robomimic nets return a dict; normalise here
-                if isinstance(actions, dict):
-                    actions = actions.get("actions", next(iter(actions.values())))
+                actions = self._extract_actions(actions)
+                actions = self._unnormalize_actions(actions)
                 return actions
 
 
+    # Build wrapper first, then attach buffers from extracted normalization
     wrapper = OnnxPolicy(actor_net, obs_keys, is_recurrent).cpu().eval()
     print("[wrap_policy] Wrapper ready → obs:", obs_keys,
           "| recurrent:", is_recurrent)
     return wrapper, obs_keys, is_recurrent
+
 
 def create_dummy_inputs(wrapper, obs_keys, is_recurrent, config):
     """
@@ -236,9 +326,20 @@ def main():
         )
         # load config early
         config = load_config(config_path)
-        policy = load_policy(ckpt_path=ckpt_path, device=args.device)
-        # inspect_policy(ckpt_path=ckpt_path, device=args.device)  # Uncomment to inspect policy and checkpoint
+        policy, ckpt_dict = load_policy(ckpt_path=ckpt_path, device=args.device)
+        print("[DEBUG] ckpt_dict keys:", list(ckpt_dict.keys()))
+        print("[DEBUG] normalization-ish subkeys:",
+             {k: list(ckpt_dict[k].keys()) for k in ckpt_dict if isinstance(ckpt_dict[k], dict) and "norm" in k.lower()})
+        # Extract action normalization (from checkpoint) and attach to wrapper as buffers
+        action_norm = extract_action_normalization(ckpt_dict)
         wrapper, obs_keys, is_recurrent = wrap_policy(policy, config)
+        # If we found normalization stats, register buffers on the wrapper so they are baked into ONNX
+        if action_norm and 'actions' in action_norm:
+            wrapper.register_buffer('act_offset', action_norm['actions']['offset'].to(torch.float32))
+            wrapper.register_buffer('act_scale',  action_norm['actions']['scale'].to(torch.float32))
+            print('[*] Registered action unnormalization buffers on wrapper')
+        else:
+            print('[*] No action normalization found; ONNX will output normalized actions ([-1, 1])')
         dummy_inputs, input_names, output_names, dyn_axes = create_dummy_inputs(wrapper, obs_keys, is_recurrent, config)
         export_to_onnx(wrapper, dummy_inputs, input_names, output_names, dyn_axes, onnx_path)
     else:
