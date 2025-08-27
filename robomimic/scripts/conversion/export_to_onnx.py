@@ -15,9 +15,8 @@ from robomimic.utils.file_utils import policy_from_checkpoint
 
 # Default folder used when no CLI args are provided (pointing to repo root)
 
-DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot_trained_models_HEK_v0_024' / 'v0_024' / '20250603001409'
-
-
+DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent /'training'/ 'bc_patcherBot_trained_models_HEK_v0_021' / 'v0_021' / '20250527191420'
+# C:\Users\sa-forest\Documents\GitHub\robomimic\training\bc_patcherBot_trained_models_HEK_v0_021\v0_021\20250527191420
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", help="Path to .pth checkpoint")
@@ -144,25 +143,36 @@ def wrap_policy(policy, config):
             self.is_recurrent = is_recurrent
             # expose these so create_dummy_inputs() can see them:
             self.obs_shapes   = obs_shapes
-            self.rnn        = getattr(actor_net, "rnn", None)
+            self.rnn          = getattr(actor_net, "rnn", None)
+            self.rnn_type     = getattr(self.rnn, "rnn_type", None)
 
         def forward(self, *tensors):
             # Split the incoming *args* into observation tensors and, if
-            # recurrent, hidden state (h0, c0)
-            obs_tensors = tensors[:len(self.obs_keys)]
+            # recurrent, hidden state tensors
+            num_obs    = len(self.obs_keys)
+            obs_tensors = tensors[:num_obs]
             obs_dict    = {k: v for k, v in zip(self.obs_keys, obs_tensors)}
 
             if self.is_recurrent:
-                h0, c0 = tensors[-2], tensors[-1]
-                actions, (h1, c1) = self.actor_net(obs_dict,
-                                                   rnn_init_state=(h0, c0),
-                                                   return_state=True)
-                return actions, h1, c1
+                if self.rnn_type == "GRU":
+                    h0 = tensors[num_obs]
+                    actions, h1 = self.actor_net.forward_step(obs_dict, rnn_state=h0)
+                    if actions.ndimension() == 3:
+                        actions = actions[:, 0]
+                    return actions, h1
+                else:  # default to LSTM behaviour
+                    h0, c0 = tensors[num_obs], tensors[num_obs + 1]
+                    actions, (h1, c1) = self.actor_net.forward_step(obs_dict, rnn_state=(h0, c0))
+                    if actions.ndimension() == 3:
+                        actions = actions[:, 0]
+                    return actions, h1, c1
             else:
                 actions = self.actor_net(obs_dict)
                 # Some robomimic nets return a dict; normalise here
                 if isinstance(actions, dict):
                     actions = actions.get("actions", next(iter(actions.values())))
+                if actions.ndimension() == 3:
+                    actions = actions[:, 0]
                 return actions
 
 
@@ -173,31 +183,36 @@ def wrap_policy(policy, config):
 
 def create_dummy_inputs(wrapper, obs_keys, is_recurrent, config):
     """
-    Build fixed-size zero tensors for export.  All dimensions—including batch
-    and sequence length—are constant, so OpenCV DNN will load the file.
+    Build fixed-size zero tensors for export. All dimensions are constant so
+    the exported ONNX model expects a single observation step.
     """
     import torch
 
-    batch = 1                                           # fixed
-    seq   = int(config["train"].get("seq_length", 1))   # fixed
+    batch = 1  # fixed
 
     dummy_inputs = [
-        torch.zeros((batch, seq, *wrapper.obs_shapes[k]), dtype=torch.float32)
+        torch.zeros((batch, *wrapper.obs_shapes[k]), dtype=torch.float32)
         for k in obs_keys
     ]
+
+    input_names = list(obs_keys)
+    output_names = ['actions']
 
     if is_recurrent:
         num_layers  = config["algo"]["rnn"]["num_layers"]
         hidden_size = config["algo"]["rnn"]["hidden_dim"]
-        dummy_inputs += [
-            torch.zeros((num_layers, batch, hidden_size), dtype=torch.float32),  # h0
-            torch.zeros((num_layers, batch, hidden_size), dtype=torch.float32)   # c0
-        ]
+        rnn_type = getattr(wrapper.rnn, "rnn_type", "LSTM")
 
-    input_names  = obs_keys + (['h0', 'c0'] if is_recurrent else [])
-    output_names = ['actions'] + (['h1', 'c1'] if is_recurrent else [])
+        dummy_inputs.append(torch.zeros((num_layers, batch, hidden_size), dtype=torch.float32))  # h0
+        input_names.append('h0')
+        output_names.append('h1')
 
-    dyn_axes = None          # <--- turn off dynamic axes completely
+        if rnn_type != "GRU":
+            dummy_inputs.append(torch.zeros((num_layers, batch, hidden_size), dtype=torch.float32))  # c0
+            input_names.append('c0')
+            output_names.append('c1')
+
+    dyn_axes = None  # <--- turn off dynamic axes completely
 
     print("[*] Created dummy inputs with fully-static shapes")
     return dummy_inputs, input_names, output_names, dyn_axes
