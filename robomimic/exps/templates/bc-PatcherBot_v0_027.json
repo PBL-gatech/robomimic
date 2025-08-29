@@ -1,7 +1,7 @@
 {
     "algo_name": "bc",
     "experiment": {
-        "name": "v0_014",
+        "name": "v0_027",
         "validate": false,
         "logging": {
             "terminal_output_to_txt": true,
@@ -36,12 +36,12 @@
         }
     },
     "train": {
-        "data": "C:/Users/sa-forest/Documents/GitHub/robomimic/data/HEK_dataset_v0_014.hdf5",
+        "data": "C:/Users/sa-forest/Documents/GitHub/robomimic/data/HEK_dataset_v0_027.hdf5",
         "output_dir": "../bc_patcherBot",
         "num_data_workers": 4,
         "hdf5_cache_mode": "all",
         "hdf5_use_swmr": true,
-        "hdf5_load_next_obs": false,
+        "hdf5_load_next_obs": true,
         "hdf5_normalize_obs": false,
         "hdf5_filter_key": null,
         "hdf5_validation_filter_key": null,
