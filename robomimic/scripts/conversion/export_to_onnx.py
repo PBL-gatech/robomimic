@@ -16,11 +16,13 @@ from robomimic.utils.file_utils import policy_from_checkpoint
 # Default folder used when no CLI args are provided (pointing to repo root)
 
 # DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent /'training'/ 'bc_patcherBot_trained_models_HEK_v0_019' / 'v0_019' / '20250527144410'
-DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent /'bc_patcherBot' / 'v0_026' / '20250827160047'
+DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent /'bc_patcherBot' / 'v0_027' / '20250829132847'
 # C:\Users\sa-forest\Documents\GitHub\robomimic\training\bc_patcherBot_trained_models_HEK_v0_021\v0_021\20250527191420
 # C:\Users\sa-forest\Documents\GitHub\robomimic\training\bc_patcherBot_trained_models_HEK_v0_019\v0_019\20250527144410\models\model_epoch_50.pth
 # C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_027\20250827164343
 # C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_026\20250827160047
+# C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_027\20250829132847
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", help="Path to .pth checkpoint")
