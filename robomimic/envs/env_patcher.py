@@ -1,251 +1,225 @@
-"""
-This file contains the PatcherBot Agent environment wrapper that is used
-to provide a standardized environment API for training policies and interacting
-with metadata present in datasets.
-"""
-import abc
-
-
-# class EnvType:
-#     """
-#     Holds environment types - one per environment class.
-#     These act as identifiers for different environments.
-#     """
-#     ROBOSUITE_TYPE = 1
-#     GYM_TYPE = 2
-#     IG_MOMART_TYPE = 3
+# env_patcher.py
+from __future__ import annotations
+from typing import Dict, Optional, Tuple, Any
+import numpy as np
+import h5py
+import cv2
 
 import robomimic.envs.env_base as EB
-import robomimic.utils.obs_utils as ObsUtils
-import json
-import numpy as np
-from copy import deepcopy
+from robomimic.envs.wrappers import FrameStackWrapper
 
 class EnvPatcher(EB.EnvBase):
-    """A base class method for environments used by this repo."""
-    @abc.abstractmethod
+    """
+    Dataset-backed environment to mimic the PatcherBot data stream.
+    Each step advances one dataset index; reward = -||a_pred - a_gt||_2.
+
+    Observation keys:
+        - "camera_image"      : (C,H,W) float32 in [0,1]
+        - "pipette_positions" : (3,) float32
+        - "stage_positions"   : (3,) float32
+        - "resistance"        : () float32
+    """
+
+    rollout_exceptions = ()
+
     def __init__(
         self,
-        env_name, 
-        render=False, 
-        render_offscreen=False, 
-        use_image_obs=False, 
-        use_depth_obs=False, 
-        **kwargs,
-    ):
-        """
-        Args:
-            env_name (str): name of environment. Only needs to be provided if making a different
-                environment from the one in @env_meta.
+        dataset_path: str,
+        *,
+        demo_id: Optional[str] = None,
+        image_key: str = "camera_image",
+        pipette_key: str = "pipette_positions",
+        stage_key: str = "stage_positions",
+        resistance_key: str = "resistance",
+        actions_key: str = "actions",
+        crop_hw: Optional[Tuple[int, int]] = None,   # <-- disabled by default
+        success_epsilon: float = 0.10,
+        horizon: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.image_key = image_key
+        self.pipette_key = pipette_key
+        self.stage_key = stage_key
+        self.resistance_key = resistance_key
+        self.actions_key = actions_key
+        self.crop_hw = crop_hw
+        self.success_epsilon = float(success_epsilon)
 
-            render (bool): if True, environment supports on-screen rendering
+        h5 = h5py.File(self.dataset_path, "r")
+        if demo_id is None:
+            demo_id = sorted(h5["data"].keys())[0]
+        self._demo_id = demo_id
+        _obs = f"data/{demo_id}/obs"
+        _root = f"data/{demo_id}"
 
-            render_offscreen (bool): if True, environment supports off-screen rendering. This
-                is forced to be True if @env_meta["use_images"] is True.
+        self._images            = h5[f"{_obs}/{self.image_key}"][:]             # (N,H,W,3) uint8
+        self._resistance        = h5[f"{_obs}/{self.resistance_key}"][:]        # (N,) or (N,1)
+        self._pipette_positions = h5[f"{_obs}/{self.pipette_key}"][:]           # (N,3)
+        self._stage_positions   = h5[f"{_obs}/{self.stage_key}"][:]             # (N,3)
+        self._actions_gt        = h5[f"{_root}/{self.actions_key}"][:]          # (N, A)
 
-            use_image_obs (bool): if True, environment is expected to render rgb image observations
-                on every env.step call. Set this to False for efficiency reasons, if image
-                observations are not required.
+        N = min(len(self._images), len(self._resistance), len(self._pipette_positions),
+                len(self._stage_positions), len(self._actions_gt))
+        if N <= 0:
+            raise RuntimeError("HDF5 contains no samples!")
+        self._N = int(N)
 
-            use_depth_obs (bool): if True, environment is expected to render depth image observations
-                on every env.step call. Set this to False for efficiency reasons, if depth
-                observations are not required.
-        """
-        self._init_kwargs = deepcopy(kwargs)
-        self._env_name = env_name
-        self._current_obs = None
-        self._current_reward = None
-        self._current_done = None
-        self._done = None
-        self.env = None
+        self._t = 0
+        self._latest_error = None
+        self._latest_error_vec = None
+        self._horizon = int(horizon) if horizon is not None else self._N
 
-    @abc.abstractmethod
-    def step(self, action):
-        """
-        Step in the environment with an action. <<< --- this should call manip and stage movement commands. 
-
-        Args:
-            action (np.array): action to take
-
-        Returns:
-            observation (dict): new observation dictionary
-            reward (float): reward for this step
-            done (bool): whether the task is done
-            info (dict): extra information
-        """
-        return 
-
-    @abc.abstractmethod
-    def reset(self):
-        """
-        Reset environment. <<<- first observation goes here. call get_observation. initialize any necesary things/variables etc...
-
-
-        Returns:
-            observation (dict): initial observation dictionary.
-        """
-
-
-        # will 
-        return
-
-    @abc.abstractmethod
-    def reset_to(self, state):
-        """
-        Reset to a specific simulator state.
-
-        Args:
-            state (dict): current simulator state
-        
-        Returns:
-            observation (dict): observation dictionary after setting the simulator state
-        """
-        return state
-
-    @abc.abstractmethod
-    def render(self, mode="human", height=None, width=None, camera_name=None):
-        """Render"""
-        return
-
-    @abc.abstractmethod
-    def get_observation(self):
-        """Get environment observation"""
-        return
-
-    @abc.abstractmethod
-    def get_state(self):
-        """Get environment simulator state, compatible with @reset_to"""
-        return
-
-    @abc.abstractmethod
-    def get_reward(self):
-        """
-        Get current reward.
-        """
-        return
-
-    @abc.abstractmethod
-    def get_goal(self):
-        """
-        Get goal observation. Not all environments support this.
-        """
-        return
-
-    @abc.abstractmethod
-    def set_goal(self, **kwargs):
-        """
-        Set goal observation with external specification. Not all environments support this.
-        """
-        return
-
-    @abc.abstractmethod
-    def is_done(self):
-        """
-        Check if the task is done (not necessarily successful).
-        """
-        return
-
-    @abc.abstractmethod
-    def is_success(self):
-        """
-        Check if the task condition(s) is reached. Should return a dictionary
-        { str: bool } with at least a "task" key for the overall task success,
-        and additional optional keys corresponding to other task criteria.
-        """
-        return
+        self._H, self._W = self._images.shape[1:3]
 
     @property
-    @abc.abstractmethod
-    def action_dimension(self):
-        """
-        Returns dimension of actions (int).
-        """
-        return
+    def name(self) -> str:
+        return "Patcher"
 
     @property
-    @abc.abstractmethod
-    def name(self):
-        """
-        Returns name of environment name (str).
-        """
-        return
+    def type(self) -> int:
+        # Use a valid builtin type to satisfy the abstract interface for option A.
+        # When you register PATCHER_TYPE (Option B), change this to EB.EnvType.PATCHER_TYPE.
+        return EB.EnvType.PATCHER_TYPE
 
     @property
-    @abc.abstractmethod
-    def type(self):
-        """
-        Returns environment type (int) for this kind of environment.
-        This helps identify this env class.
-        """
-        return
+    def base_env(self):
+        # No underlying simulator; the dataset-backed env is the base.
+        return self
 
     @property
-    def version(self):
-        """
-        Returns version of environment (str).
-        This is not an abstract method, some subclasses do not implement it
-        """
-        return None
-
-    @abc.abstractmethod
-    def serialize(self):
-        """
-        Save all information needed to re-instantiate this environment in a dictionary.
-        This is the same as @env_meta - environment metadata stored in hdf5 datasets,
-        and used in utils/env_utils.py.
-        """
-        return
+    def action_dimension(self) -> int:
+        return int(self._actions_gt.shape[-1])
 
     @classmethod
-    @abc.abstractmethod
     def create_for_data_processing(
-        cls, 
-        camera_names, 
-        camera_height, 
-        camera_width, 
-        reward_shaping, 
-        render=None, 
-        render_offscreen=None, 
-        use_image_obs=None, 
-        use_depth_obs=None, 
+        cls,
+        camera_names=None,
+        camera_height=None,
+        camera_width=None,
+        reward_shaping=False,
+        render=None,
+        render_offscreen=None,
+        use_image_obs=None,
+        use_depth_obs=None,
         **kwargs,
     ):
-        """
-        Create environment for processing datasets, which includes extracting
-        observations, labeling dense / sparse rewards, and annotating dones in
-        transitions. 
+        # Expect dataset_path in kwargs; pass everything through.
+        return cls(**kwargs)
 
-        Args:
-            camera_names ([str]): list of camera names that correspond to image observations
-            camera_height (int): camera height for all cameras
-            camera_width (int): camera width for all cameras
-            reward_shaping (bool): if True, use shaped environment rewards, else use sparse task completion rewards
-            render (bool or None): optionally override rendering behavior. Defaults to False.
-            render_offscreen (bool or None): optionally override rendering behavior. The default value is True if
-                @camera_names is non-empty, False otherwise.
-            use_image_obs (bool or None): optionally override rendering behavior. The default value is True if
-                @camera_names is non-empty, False otherwise.
-            use_depth_obs (bool): if True, use depth observations
+    def get_goal(self):
+        # This dataset-backed env has no separate goal concept.
+        return {}
 
-        Returns:
-            env (EnvBase instance)
-        """
+    def set_goal(self, **kwargs):
+        # No-op for this env
         return
 
-    @property
-    @abc.abstractmethod
-    def rollout_exceptions(self):
-        """
-        Return tuple of exceptions to except when doing rollouts. This is useful to ensure
-        that the entire training run doesn't crash because of a bad policy that causes unstable
-        simulation computations.
-        """
-        return
+    def get_reward(self) -> float:
+        # Return last step's reward if available, else 0.0 before any step
+        if self._latest_error is None:
+            return 0.0
+        return float(-self._latest_error)
 
-    @property
-    @abc.abstractmethod
-    def base_env(self):
-        """
-        Grabs base simulation environment.
-        """
-        return
+    def is_done(self) -> bool:
+        return bool(self._t >= self._horizon)
+
+
+    def reset(self) -> Dict[str, np.ndarray]:
+        self._t = 0
+        self._latest_error = None
+        self._latest_error_vec = None
+        return self.get_observation()
+
+    def get_state(self) -> Dict[str, Any]:
+        return {"t": int(self._t), "demo_id": self._demo_id}
+
+    def reset_to(self, state: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        self._t = int(state.get("t", 0))
+        return self.get_observation()
+
+    def step(self, action: np.ndarray):
+        act_pred = np.asarray(action, dtype=np.float32).reshape(-1)
+        act_gt   = np.asarray(self._actions_gt[self._t], dtype=np.float32).reshape(-1)
+
+        err_vec = act_pred - act_gt
+        err = float(np.linalg.norm(err_vec, ord=2))
+        self._latest_error = err
+        self._latest_error_vec = err_vec
+
+        self._t += 1
+        done = (self._t >= self._horizon) or (self.is_success()["task"])
+
+        obs_next = self.get_observation()
+        reward = -err
+        info = {"error_l2": err, "error_vec": err_vec.copy(), "t": int(self._t)}
+        return obs_next, reward, done, info
+
+    def is_success(self) -> Dict[str, bool]:
+        ok = (self._latest_error is not None) and (self._latest_error <= self.success_epsilon)
+        return {"task": bool(ok)}
+
+    def get_observation(self, obs: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, np.ndarray]:
+        t = min(max(self._t, 0), self._N - 1)
+        im_hw3 = self._images[t]  # HWC uint8
+        # If you ever need deterministic center cropping for ablations, set crop_hw.
+        if self.crop_hw is not None:
+            ch, cw = self.crop_hw
+            H0, W0 = im_hw3.shape[:2]
+            y0 = max(0, (H0 - ch) // 2);  x0 = max(0, (W0 - cw) // 2)
+            im_c = im_hw3[y0:y0+ch, x0:x0+cw]
+            im_r = cv2.resize(im_c, (W0, H0), interpolation=cv2.INTER_LINEAR)
+            im_chw = im_r.astype(np.float32).transpose(2, 0, 1) / 255.0
+        else:
+            im_chw = im_hw3.astype(np.float32).transpose(2, 0, 1) / 255.0
+
+        pip = self._pipette_positions[t].astype(np.float32).reshape(-1)
+        stg = self._stage_positions[t].astype(np.float32).reshape(-1)
+        res = np.array(self._resistance[t], dtype=np.float32).reshape(())
+
+        return {
+            self.image_key      : im_chw,
+            self.pipette_key    : pip,
+            self.stage_key      : stg,
+            self.resistance_key : res,
+        }
+
+    def render(self, mode: str = "human", height: Optional[int] = None,
+               width: Optional[int] = None, camera_name: Optional[str] = None, **kwargs):
+        if mode == "rgb_array":
+            t = min(max(self._t, 0), self._N - 1)
+            img = self._images[t]
+            if (height is not None) and (width is not None) and (height > 0) and (width > 0):
+                img = cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
+            return img
+        elif mode == "human":
+            img = self.render(mode="rgb_array", height=height or self._H, width=width or self._W)
+            cv2.imshow(camera_name or "EnvPatcher", img[:, :, ::-1])
+            cv2.waitKey(1)
+            return None
+        else:
+            return None
+
+    def serialize(self) -> Dict[str, Any]:
+        return dict(
+            env_name="Patcher",
+            type="PATCHER_TYPE",
+            env_kwargs=dict(
+                dataset_path=self.dataset_path,
+                demo_id=self._demo_id,
+                image_key=self.image_key,
+                pipette_key=self.pipette_key,
+                stage_key=self.stage_key,
+                resistance_key=self.resistance_key,
+                actions_key=self.actions_key,
+                crop_hw=self.crop_hw,
+                success_epsilon=self.success_epsilon,
+                horizon=self._horizon,
+            ),
+        )
+
+def create_env_patcher(dataset_path: str, *, frame_stack: int = 1, **kwargs):
+    base = EnvPatcher(dataset_path=dataset_path, **kwargs)
+    if frame_stack and frame_stack > 1:
+        return FrameStackWrapper(base, num_frames=frame_stack)
+    return base

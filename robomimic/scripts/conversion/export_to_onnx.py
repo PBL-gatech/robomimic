@@ -16,7 +16,7 @@ from robomimic.utils import obs_utils as ObsUtils
 
 # Default folder used when no CLI args are provided (pointing to repo root)
 
-DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'training' /'bc_patcherBot_trained_models_HEK_v0_024' / 'v0_024' / '20250603001409'
+DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent /'bc_patcherBot' / 'v0_029' / '20250831172330'
 
 
 def parse_args():
@@ -269,7 +269,8 @@ def create_dummy_inputs(wrapper, obs_keys, is_recurrent, config):
     import torch
 
     batch = 1                                           # fixed
-    seq   = int(config["train"].get("seq_length", 1))   # fixed
+    # seq   = int(config["train"].get("seq_length", 1))   # fixed
+    seq = 1
 
     dummy_inputs = [
         torch.zeros((batch, seq, *wrapper.obs_shapes[k]), dtype=torch.float32)

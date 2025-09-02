@@ -35,7 +35,6 @@ import robomimic
 import robomimic.utils.train_utils as TrainUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
-import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.file_utils as FileUtils
 from robomimic.config import config_factory
 from robomimic.algo import algo_factory, RolloutPolicy
@@ -71,8 +70,7 @@ def train(config, device, resume=False):
     # read config to set up metadata for observation modalities (e.g. detecting rgb observations)
     ObsUtils.initialize_obs_utils_with_config(config)
 
-    # extract the metadata and shape metadata across all datasets
-    env_meta_list = []
+    # extract shape metadata across all datasets (no env_meta usage)
     shape_meta_list = []
     if isinstance(config.train.data, str):
         # if only a single dataset is provided, convert to list
@@ -84,19 +82,6 @@ def train(config, device, resume=False):
         if not os.path.exists(dataset_path):
             raise Exception("Dataset at provided path {} not found!".format(dataset_path))
 
-        # load basic metadata from training file
-        print("\n============= Loaded Environment Metadata =============")
-        env_meta = None
-    # env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=dataset_path)
-
-        # populate language instruction for env in env_meta
-        env_meta["lang"] = dataset_cfg.get("lang", "dummy")
-
-        # update env meta if applicable
-        from robomimic.utils.python_utils import deep_update
-        deep_update(env_meta, config.experiment.env_meta_update_dict)
-        env_meta_list.append(env_meta)
-
         shape_meta = FileUtils.get_shape_metadata_from_dataset(
             dataset_config=dataset_cfg,
             action_keys=config.train.action_keys,
@@ -106,53 +91,15 @@ def train(config, device, resume=False):
         shape_meta_list.append(shape_meta)
     print(f"testing shape_meta: {shape_meta}")
 
-    if config.experiment.env is not None:
-        # if an environment name is specified, just use this env using the first dataset's metadata
-        # and ignore envs from all datasets
-        env_meta = env_meta_list[0].copy()
-        env_meta["env_name"] = config.experiment.env
-        env_meta_list = [env_meta]
-        print("=" * 30 + "\n" + "Replacing Env to {}\n".format(env_meta["env_name"]) + "=" * 30)
-
     # create environment
     envs = OrderedDict()
     if config.experiment.rollout.enabled:
-        # create environments for validation runs
-        for env_i in range(len(env_meta_list)):
-            # check if this env should be evaluated
+        # environments disabled (no env creation)
+        for env_i in range(len(config.train.data)):
             dataset_cfg = config.train.data[env_i]
             do_eval = dataset_cfg.get("eval", True)
             if not do_eval:
                 continue
-
-            env_meta = env_meta_list[env_i]
-            shape_meta = shape_meta_list[env_i]
-
-            env_names = [env_meta["env_name"]]
-            if (env_i == 0) and (config.experiment.additional_envs is not None):
-                # if additional environments are specified, add them to the list
-                # all additional environments use env_meta from the first dataset
-                for name in config.experiment.additional_envs:
-                    env_names.append(name)
-
-            # create environment for each env_name
-            def create_env(env_name):
-                env_kwargs = dict(
-                    env_meta=env_meta,
-                    env_name=env_name,
-                    render=False,
-                    render_offscreen=config.experiment.render_video,
-                    use_image_obs=shape_meta["use_images"],
-                )
-                env = EnvUtils.create_env_from_metadata(**env_kwargs)
-                # handle environment wrappers
-                env = EnvUtils.wrap_env_from_config(env, config=config)  # apply environment warpper, if applicable
-                return env
-            for env_name in env_names:
-                env = create_env(env_name)
-                env_key = os.path.splitext(os.path.basename(dataset_cfg["path"]))[0] if not dataset_cfg.get("key", None) else dataset_cfg["key"]
-                envs[env_key] = env
-                print(env)
 
     print("")
 
@@ -359,7 +306,8 @@ def train(config, device, resume=False):
         # do rollouts at fixed rate or if it's time to save a new ckpt
         video_paths = None
         rollout_check = (epoch % config.experiment.rollout.rate == 0) or (should_save_ckpt and ckpt_reason == "time")
-        if config.experiment.rollout.enabled and (epoch > config.experiment.rollout.warmstart) and rollout_check:
+        # skip rollouts entirely if no envs are defined
+        if config.experiment.rollout.enabled and (epoch > config.experiment.rollout.warmstart) and rollout_check and (len(envs) > 0):
             # wrap model as a RolloutPolicy to prepare for rollouts
             rollout_model = RolloutPolicy(
                 model,
@@ -423,7 +371,7 @@ def train(config, device, resume=False):
             TrainUtils.save_model(
                 model=model,
                 config=config,
-                env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
+                env_meta=None,
                 shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
                 variable_state=variable_state,
                 ckpt_path=os.path.join(ckpt_dir, epoch_ckpt_name + ".pth"),
@@ -436,7 +384,7 @@ def train(config, device, resume=False):
         TrainUtils.save_model(
             model=model,
             config=config,
-            env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
+            env_meta=None,
             shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
             variable_state=variable_state,
             ckpt_path=latest_model_path,
@@ -519,7 +467,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\bc-PatcherBot_v0_027.json",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\bc-PatcherBot_v0_029.json",
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
     )
