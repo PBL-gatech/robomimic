@@ -14,7 +14,7 @@ class EnvPatcher(EB.EnvBase):
     Each step advances one dataset index; reward = -||a_pred - a_gt||_2.
 
     Observation keys:
-        - "camera_image"      : (C,H,W) float32 in [0,1]
+        - "camera_image"      : (H,W,3) uint8 (ObsUtils will CHW + normalize)
         - "pipette_positions" : (3,) float32
         - "stage_positions"   : (3,) float32
         - "resistance"        : () float32
@@ -24,8 +24,16 @@ class EnvPatcher(EB.EnvBase):
 
     def __init__(
         self,
-        dataset_path: str,
+        dataset_path: str = None,
         *,
+        # standard EnvBase ctor params (accepted for compatibility; unused)
+        env_name: Optional[str] = None,
+        render: bool = False,
+        render_offscreen: bool = False,
+        use_image_obs: bool = True,
+        use_depth_obs: bool = False,
+        lang: Optional[str] = None,
+        # patcher-specific
         demo_id: Optional[str] = None,
         image_key: str = "camera_image",
         pipette_key: str = "pipette_positions",
@@ -35,8 +43,9 @@ class EnvPatcher(EB.EnvBase):
         crop_hw: Optional[Tuple[int, int]] = None,   # <-- disabled by default
         success_epsilon: float = 0.10,
         horizon: Optional[int] = None,
+        **kwargs,
     ) -> None:
-        super().__init__()
+        # Note: follow EnvGym / EnvRobosuite pattern – do not call EnvBase.__init__
         self.dataset_path = dataset_path
         self.image_key = image_key
         self.pipette_key = pipette_key
@@ -94,6 +103,7 @@ class EnvPatcher(EB.EnvBase):
     @classmethod
     def create_for_data_processing(
         cls,
+        env_name=None,
         camera_names=None,
         camera_height=None,
         camera_width=None,
@@ -105,7 +115,8 @@ class EnvPatcher(EB.EnvBase):
         **kwargs,
     ):
         # Expect dataset_path in kwargs; pass everything through.
-        return cls(**kwargs)
+        return cls(env_name=env_name, render=bool(render), render_offscreen=bool(render_offscreen),
+                   use_image_obs=bool(use_image_obs), use_depth_obs=bool(use_depth_obs), **kwargs)
 
     def get_goal(self):
         # This dataset-backed env has no separate goal concept.
@@ -132,7 +143,13 @@ class EnvPatcher(EB.EnvBase):
         return self.get_observation()
 
     def get_state(self) -> Dict[str, Any]:
-        return {"t": int(self._t), "demo_id": self._demo_id}
+        # Provide a "states" vector for compatibility with run_trained_agent dataset logging
+        t = min(max(self._t, 0), self._N - 1)
+        pip = self._pipette_positions[t].astype(np.float32).reshape(-1)
+        stg = self._stage_positions[t].astype(np.float32).reshape(-1)
+        res = np.array(self._resistance[t], dtype=np.float32).reshape(1)
+        states = np.concatenate([pip, stg, res], axis=0)
+        return {"t": int(self._t), "demo_id": self._demo_id, "states": states}
 
     def reset_to(self, state: Dict[str, Any]) -> Dict[str, np.ndarray]:
         self._t = int(state.get("t", 0))
@@ -161,24 +178,21 @@ class EnvPatcher(EB.EnvBase):
 
     def get_observation(self, obs: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, np.ndarray]:
         t = min(max(self._t, 0), self._N - 1)
-        im_hw3 = self._images[t]  # HWC uint8
-        # If you ever need deterministic center cropping for ablations, set crop_hw.
+        im_hw3 = self._images[t]  # HWC uint8 (expected by ObsUtils ImageModality processor)
+        # Optional deterministic center crop to maintain raw HWC format.
         if self.crop_hw is not None:
             ch, cw = self.crop_hw
             H0, W0 = im_hw3.shape[:2]
             y0 = max(0, (H0 - ch) // 2);  x0 = max(0, (W0 - cw) // 2)
             im_c = im_hw3[y0:y0+ch, x0:x0+cw]
-            im_r = cv2.resize(im_c, (W0, H0), interpolation=cv2.INTER_LINEAR)
-            im_chw = im_r.astype(np.float32).transpose(2, 0, 1) / 255.0
-        else:
-            im_chw = im_hw3.astype(np.float32).transpose(2, 0, 1) / 255.0
+            im_hw3 = cv2.resize(im_c, (W0, H0), interpolation=cv2.INTER_LINEAR)
 
         pip = self._pipette_positions[t].astype(np.float32).reshape(-1)
         stg = self._stage_positions[t].astype(np.float32).reshape(-1)
         res = np.array(self._resistance[t], dtype=np.float32).reshape(())
 
         return {
-            self.image_key      : im_chw,
+            self.image_key      : im_hw3,
             self.pipette_key    : pip,
             self.stage_key      : stg,
             self.resistance_key : res,
@@ -203,7 +217,7 @@ class EnvPatcher(EB.EnvBase):
     def serialize(self) -> Dict[str, Any]:
         return dict(
             env_name="Patcher",
-            type="PATCHER_TYPE",
+            type=self.type,
             env_kwargs=dict(
                 dataset_path=self.dataset_path,
                 demo_id=self._demo_id,
