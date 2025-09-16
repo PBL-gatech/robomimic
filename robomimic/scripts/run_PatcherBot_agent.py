@@ -10,7 +10,8 @@ import robomimic.utils.torch_utils as TorchUtils
 
 from robomimic.envs.env_patcher import create_env_patcher
 
-agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_029\20250831172330\models\model_epoch_50.pth"
+# agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_029\20250831172330\models\model_epoch_50.pth"
+agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_031\20250915183951\models\model_epoch_50.pth"
 # agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_030\20250915140359\last.pth"
 dataset = r"C:\\Users\\sa-forest\\Documents\\GitHub\\holypipette-pbl\\holypipette\\deepLearning\\patchModel\\test_data\\HEKHUNTER_inference_set3.hdf5"
 def main():
