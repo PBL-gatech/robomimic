@@ -536,17 +536,18 @@ class RolloutPolicy(object):
             ob = TensorUtils.to_batch(ob)
         ob = TensorUtils.to_device(ob, self.policy.device)
         ob = TensorUtils.to_float(ob)
+        # process visual observations before normalization so shapes align with saved stats
+        for k in ob:
+            if ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb") or \
+               ObsUtils.key_is_obs_modality(key=k, obs_modality="depth"):
+                if postprocess_visual_obs or (self.obs_normalization_stats is not None):
+                    ob[k] = ObsUtils.process_obs(obs=ob[k], obs_key=k)
         if self.obs_normalization_stats is not None:
             # ensure obs_normalization_stats are torch Tensors on proper device
             obs_normalization_stats = TensorUtils.to_float(TensorUtils.to_device(TensorUtils.to_tensor(self.obs_normalization_stats), self.policy.device))
             # limit normalization to obs keys being used, in case environment includes extra keys
             ob = { k : ob[k] for k in self.policy.global_config.all_obs_keys }
             ob = ObsUtils.normalize_dict(ob, normalization_stats=obs_normalization_stats)
-        # postprocess visual observations
-        if postprocess_visual_obs:
-            for k in ob:
-                if ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb") or ObsUtils.key_is_obs_modality(key=k, obs_modality="depth"):
-                    ob[k] = ObsUtils.process_obs(obs=ob[k], obs_key=k)
         return ob
 
     def __repr__(self):

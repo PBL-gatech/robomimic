@@ -1,7 +1,7 @@
 {
     "algo_name": "bc",
     "experiment": {
-        "name": "v0_033",
+        "name": "v0_034",
         "validate": false,
         "logging": {
             "terminal_output_to_txt": true,
@@ -12,7 +12,7 @@
         "save": {
             "enabled": true,
             "every_n_seconds": null,
-            "every_n_epochs": 5,
+            "every_n_epochs": 15,
             "epochs": [],
             "on_best_validation": false,
             "on_best_rollout_return": false,
@@ -57,7 +57,7 @@
         "goal_mode": "last",
         "cuda": true,
         "batch_size": 16,
-        "num_epochs": 50,
+        "num_epochs": 150,
         "seed": 1
     },
     "algo": {

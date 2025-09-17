@@ -57,8 +57,9 @@ class EnvPatcher(EB.EnvBase):
 
         h5 = h5py.File(self.dataset_path, "r")
         if demo_id is None:
-            demo_id = sorted(h5["data"].keys())[0]
+            demo_id = sorted(h5["data"].keys())[1]
         self._demo_id = demo_id
+        print(f"[EnvPatcher] loading demo_id={self._demo_id} from {self.dataset_path}")
         _obs = f"data/{demo_id}/obs"
         _root = f"data/{demo_id}"
 
@@ -78,6 +79,7 @@ class EnvPatcher(EB.EnvBase):
         self._latest_error = None
         self._latest_error_vec = None
         self._horizon = int(horizon) if horizon is not None else self._N
+        self._goal_index = min(max(self._horizon - 1, 0), self._N - 1)
 
         self._H, self._W = self._images.shape[1:3]
 
@@ -119,11 +121,18 @@ class EnvPatcher(EB.EnvBase):
                    use_image_obs=bool(use_image_obs), use_depth_obs=bool(use_depth_obs), **kwargs)
 
     def get_goal(self):
-        # This dataset-backed env has no separate goal concept.
-        return {}
+        return self._observation_at_index(self._goal_index)
 
     def set_goal(self, **kwargs):
-        # No-op for this env
+        idx = None
+        if "index" in kwargs:
+            idx = kwargs["index"]
+        elif "t" in kwargs:
+            idx = kwargs["t"]
+        if idx is None:
+            return
+        idx = int(idx)
+        self._goal_index = min(max(idx, 0), self._N - 1)
         return
 
     def get_reward(self) -> float:
@@ -178,24 +187,28 @@ class EnvPatcher(EB.EnvBase):
 
     def get_observation(self, obs: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, np.ndarray]:
         t = min(max(self._t, 0), self._N - 1)
+        return self._observation_at_index(t)
+
+    def _observation_at_index(self, index: int) -> Dict[str, np.ndarray]:
+        t = min(max(int(index), 0), self._N - 1)
         im_hw3 = self._images[t]  # HWC uint8 (expected by ObsUtils ImageModality processor)
-        # Optional deterministic center crop to maintain raw HWC format.
         if self.crop_hw is not None:
             ch, cw = self.crop_hw
             H0, W0 = im_hw3.shape[:2]
-            y0 = max(0, (H0 - ch) // 2);  x0 = max(0, (W0 - cw) // 2)
-            im_c = im_hw3[y0:y0+ch, x0:x0+cw]
+            y0 = max(0, (H0 - ch) // 2)
+            x0 = max(0, (W0 - cw) // 2)
+            im_c = im_hw3[y0:y0 + ch, x0:x0 + cw]
             im_hw3 = cv2.resize(im_c, (W0, H0), interpolation=cv2.INTER_LINEAR)
 
         pip = self._pipette_positions[t].astype(np.float32).reshape(-1)
         stg = self._stage_positions[t].astype(np.float32).reshape(-1)
-        res = np.array(self._resistance[t], dtype=np.float32).reshape(())
+        res = np.array(self._resistance[t], dtype=np.float32).reshape(-1)
 
         return {
-            self.image_key      : im_hw3,
-            self.pipette_key    : pip,
-            self.stage_key      : stg,
-            self.resistance_key : res,
+            self.image_key: im_hw3,
+            self.pipette_key: pip,
+            self.stage_key: stg,
+            self.resistance_key: res,
         }
 
     def render(self, mode: str = "human", height: Optional[int] = None,
