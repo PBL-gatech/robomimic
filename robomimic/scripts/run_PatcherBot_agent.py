@@ -12,11 +12,16 @@ from robomimic.envs.env_patcher import create_env_patcher
 
 # agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_029\20250831172330\models\model_epoch_50.pth"
 # agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_031\20250915183951\models\model_epoch_50.pth"
-agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_034\20250916172830\last.pth"
+# agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_034\20250916172830\last.pth"
+# agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_035\20250917152411\last.pth"
 # agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_030\20250915140359\last.pth"
+# agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_036\20250918011750\last.pth"
+# agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_037\20250921164912\last.pth"
+# version 38 testing
+agent = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\v0_038\20250921221249\models\model_epoch_500.pth"
 # dataset = r"C:\\Users\\sa-forest\\Documents\\GitHub\\holypipette-pbl\\holypipette\\deepLearning\\patchModel\\test_data\\HEKHUNTER_inference_set3.hdf5"
-dataset = r"c:\Users\sa-forest\Documents\GitHub\holypipette-pbl\holypipette\deepLearning\patchModel\test_data\HEKHUNTER_inference_set_goal2.hdf5"
-# dataset = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\holypipette\deepLearning\patchModel\test_data\HEKHUNTER_sanity_set_goal.hdf5"
+dataset = r"c:\Users\sa-forest\Documents\GitHub\holypipette-pbl\holypipette\deepLearning\patchModel\test_data\HEKHUNTER_inference_set_goal3.hdf5"
+# dataset = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\holypipette\deepLearning\patchModel\test_data\HEKHUNTER_sanity_set_goal3.hdf5"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", required=False, default = agent,  help="Path to .pth checkpoint")
