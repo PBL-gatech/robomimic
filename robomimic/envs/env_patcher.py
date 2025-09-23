@@ -42,6 +42,7 @@ class EnvPatcher(EB.EnvBase):
         actions_key: str = "actions",
         crop_hw: Optional[Tuple[int, int]] = None,   # <-- disabled by default
         success_epsilon: float = 0.10,
+        frame_stack: int = 1,
         horizon: Optional[int] = None,
         **kwargs,
     ) -> None:
@@ -54,10 +55,11 @@ class EnvPatcher(EB.EnvBase):
         self.actions_key = actions_key
         self.crop_hw = crop_hw
         self.success_epsilon = float(success_epsilon)
+        self.frame_stack = int(frame_stack) if frame_stack else 1
 
         h5 = h5py.File(self.dataset_path, "r")
         if demo_id is None:
-            demo_id = sorted(h5["data"].keys())[1]
+            demo_id = sorted(h5["data"].keys())[0]
         self._demo_id = demo_id
         print(f"[EnvPatcher] loading demo_id={self._demo_id} from {self.dataset_path}")
         _obs = f"data/{demo_id}/obs"
@@ -242,11 +244,15 @@ class EnvPatcher(EB.EnvBase):
                 crop_hw=self.crop_hw,
                 success_epsilon=self.success_epsilon,
                 horizon=self._horizon,
+                frame_stack=self.frame_stack,
             ),
         )
 
 def create_env_patcher(dataset_path: str, *, frame_stack: int = 1, **kwargs):
-    base = EnvPatcher(dataset_path=dataset_path, **kwargs)
+    base = EnvPatcher(dataset_path=dataset_path, frame_stack=frame_stack, **kwargs)
     if frame_stack and frame_stack > 1:
-        return FrameStackWrapper(base, num_frames=frame_stack)
+        wrapped = FrameStackWrapper(base, num_frames=frame_stack)
+        setattr(wrapped, "frame_stack", frame_stack)
+        return wrapped
     return base
+

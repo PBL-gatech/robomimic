@@ -467,8 +467,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\bc-PatcherBot_v0_039.json",
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\df-PatcherBot_v0_002.json",
+        # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\bc-PatcherBot_v0_040.json",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\df-PatcherBot_v0_003.json",
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
     )

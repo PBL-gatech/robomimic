@@ -9,7 +9,7 @@ Usage (example):
     # Or specify files manually (original approach):
     python export_to_onnx.py --ckpt model_epoch_485.pth --config config.json --out policy.onnx
 """
-import argparse, torch, json, pathlib, glob, re
+import argparse, torch, json, pathlib, glob, re, copy
 from collections import OrderedDict
 
 from robomimic.utils.file_utils import policy_from_checkpoint
@@ -88,7 +88,12 @@ def load_config(config_path):
     """Load JSON config and print relevant sections."""
     cfg = json.load(open(config_path, "r"))
     print("[load_config] obs modalities:", cfg["observation"]["modalities"]["obs"])
-    print("[load_config] rnn settings:", cfg["algo"]["rnn"])
+    algo_section = cfg.get("algo", {})
+    rnn_cfg = algo_section.get("rnn") if isinstance(algo_section, dict) else None
+    if rnn_cfg is not None:
+        print("[load_config] rnn settings:", rnn_cfg)
+    else:
+        print("[load_config] rnn settings: <none>")
     return cfg
 
 
@@ -200,21 +205,24 @@ def extract_obs_normalization(policy, obs_keys, goal_keys):
     return tensor_stats
 
 
-def wrap_policy(policy, config, action_norm_stats):
+def wrap_policy(policy, config, action_norm_stats, ckpt_dict):
     """
-    Build a thin wrapper around the loaded Robomimic policy so that it can be
-    exported to ONNX.
+    Dispatch to the appropriate ONNX wrapper based on the checkpoint algorithm.
+    """
+    policy_obj = policy[0] if isinstance(policy, tuple) else policy
+    algo_name = str(ckpt_dict.get("algo_name", ""))
+    algo_name = algo_name.lower()
+    if algo_name == "diffusion_policy":
+        print("[wrap_policy] Detected diffusion policy checkpoint")
+        return wrap_diffusion_policy(policy_obj, action_norm_stats or {})
+    print(f"[wrap_policy] Using standard wrapper for algo='{algo_name or 'unknown'}'")
+    return wrap_standard_policy(policy_obj, config, action_norm_stats or {})
 
-    Returns
-    -------
-    wrapper : nn.Module  -- Forward pass ready for `torch.onnx.export`
-    obs_keys : List[str] -- Order of observations expected by wrapper
-    goal_keys : List[str] -- Goal observation keys (can be empty)
-    is_recurrent : bool  -- Whether the policy carries RNN state
-    """
+
+def wrap_standard_policy(policy_obj, config, action_norm_stats):
+    """Existing BC-style wrapper supporting feedforward and RNN actors."""
     import torch.nn as nn
 
-    policy_obj = policy[0] if isinstance(policy, tuple) else policy
     inner = policy_obj.policy
 
     actor_net = inner
@@ -243,7 +251,9 @@ def wrap_policy(policy, config, action_norm_stats):
 
     obs_keys = list(obs_shapes.keys())
     goal_keys = list(goal_shapes.keys())
-    is_recurrent = bool(config["algo"]["rnn"]["enabled"])
+    algo_cfg = config.get("algo", {}) if isinstance(config, dict) else {}
+    rnn_cfg = algo_cfg.get("rnn", {}) if isinstance(algo_cfg, dict) else {}
+    is_recurrent = bool(rnn_cfg.get("enabled", False))
 
     obs_norm_stats = extract_obs_normalization(policy_obj, obs_keys, goal_keys)
     action_norm = action_norm_stats.get("actions") if action_norm_stats else None
@@ -259,6 +269,9 @@ def wrap_policy(policy, config, action_norm_stats):
             self.obs_shapes = obs_shapes
             self.goal_shapes = goal_shapes
             self.rnn = getattr(actor_net, "rnn", None)
+            self.requires_action_cache = False
+            self.observation_horizon = 1
+            self.output_names = ["actions"] + (["h1", "c1"] if self.is_recurrent else [])
 
             self.obs_norm_stats = OrderedDict()
             if obs_norm_stats:
@@ -381,15 +394,248 @@ def wrap_policy(policy, config, action_norm_stats):
     return wrapper, obs_keys, goal_keys, is_recurrent
 
 
+def wrap_diffusion_policy(policy_obj, action_norm_stats):
+    """Wrapper for diffusion policies that manages action horizons via a cache."""
+    import torch
+    import torch.nn as nn
+
+    inner = policy_obj.policy
+    if not hasattr(inner, "algo_config"):
+        raise AttributeError("Diffusion policy is missing algo_config")
+
+    algo_cfg = inner.algo_config
+    horizon_cfg = getattr(algo_cfg, "horizon", None)
+    if horizon_cfg is None:
+        raise AttributeError("Diffusion policy config missing horizon settings")
+
+    action_horizon = int(horizon_cfg.action_horizon)
+    observation_horizon = int(horizon_cfg.observation_horizon)
+    prediction_horizon = int(horizon_cfg.prediction_horizon)
+
+    obs_shapes = OrderedDict(inner.obs_shapes)
+    goal_shapes = OrderedDict(getattr(inner, "goal_shapes", OrderedDict()))
+    obs_keys = list(obs_shapes.keys())
+    goal_keys = list(goal_shapes.keys())
+
+    obs_norm_stats = extract_obs_normalization(policy_obj, obs_keys, goal_keys)
+    action_norm = action_norm_stats.get("actions") if action_norm_stats else None
+
+    if inner.ema is not None:
+        policy_module = inner.ema.averaged_model["policy"]
+    else:
+        policy_module = inner.nets["policy"]
+
+    obs_encoder = policy_module["obs_encoder"]
+    noise_pred_net = policy_module["noise_pred_net"]
+    noise_scheduler = copy.deepcopy(inner.noise_scheduler)
+    if noise_scheduler is None:
+        raise ValueError("Diffusion policy missing noise scheduler")
+
+    if algo_cfg.ddpm.enabled:
+        num_inference_timesteps = int(algo_cfg.ddpm.num_inference_timesteps)
+    elif algo_cfg.ddim.enabled:
+        num_inference_timesteps = int(algo_cfg.ddim.num_inference_timesteps)
+    else:
+        raise ValueError("Unsupported diffusion scheduler configuration")
+    noise_scheduler.set_timesteps(num_inference_timesteps)
+    timesteps = noise_scheduler.timesteps
+    if not isinstance(timesteps, torch.Tensor):
+        timesteps = torch.tensor(list(timesteps), dtype=torch.long)
+    else:
+        timesteps = timesteps.clone().to(torch.long)
+
+    class DiffusionOnnxPolicy(nn.Module):
+        def __init__(self, obs_encoder, noise_pred_net, noise_scheduler, timesteps, obs_keys, goal_keys, obs_shapes, goal_shapes, obs_norm_stats, action_norm, action_horizon, observation_horizon, prediction_horizon, action_dim):
+            super().__init__()
+            self.obs_encoder = obs_encoder
+            self.noise_pred_net = noise_pred_net
+            self.noise_scheduler = noise_scheduler
+            self.register_buffer("timesteps", timesteps)
+
+            self.obs_keys = obs_keys
+            self.goal_keys = goal_keys
+            self.obs_shapes = obs_shapes
+            self.goal_shapes = goal_shapes
+            self.requires_action_cache = True
+            self.is_recurrent = False
+            self.output_names = ["action", "action_cache", "cache_index"]
+
+            self.action_horizon = action_horizon
+            self.observation_horizon = observation_horizon
+            self.prediction_horizon = prediction_horizon
+            self.action_dim = action_dim
+            self.start_index = max(observation_horizon - 1, 0)
+
+            self.obs_norm_stats = OrderedDict()
+            if obs_norm_stats:
+                for idx, (key, stats) in enumerate(obs_norm_stats.items()):
+                    offset = stats["offset"]
+                    scale = stats["scale"]
+                    target_dim = len(self.obs_shapes[key]) + 1
+                    while offset.dim() < target_dim:
+                        offset = TensorUtils.unsqueeze(offset, 0)
+                        scale = TensorUtils.unsqueeze(scale, 0)
+                    offset_name = f"obs_offset_{idx}"
+                    scale_name = f"obs_scale_{idx}"
+                    self.register_buffer(offset_name, offset.to(torch.float32))
+                    self.register_buffer(scale_name, scale.to(torch.float32))
+                    self.obs_norm_stats[key] = {
+                        "offset": getattr(self, offset_name),
+                        "scale": getattr(self, scale_name),
+                    }
+
+            if action_norm is not None:
+                self.register_buffer("act_offset", action_norm["offset"].to(torch.float32))
+                self.register_buffer("act_scale", action_norm["scale"].to(torch.float32))
+            else:
+                self.act_offset = None
+                self.act_scale = None
+
+        def _build_obs_dict(self, keys, tensors):
+            return OrderedDict((k, v) for k, v in zip(keys, tensors))
+
+        def _apply_obs_normalization(self, tensors):
+            if not self.obs_norm_stats:
+                return tensors
+            sub_stats = OrderedDict((k, self.obs_norm_stats[k]) for k in tensors if k in self.obs_norm_stats)
+            if sub_stats:
+                ObsUtils.normalize_dict(tensors, normalization_stats=sub_stats)
+            return tensors
+
+        def _process_obs_group(self, tensors):
+            if not tensors:
+                return tensors
+            processed = TensorUtils.to_float(tensors)
+            processed = ObsUtils.process_obs_dict(processed)
+            processed = self._apply_obs_normalization(processed)
+            return processed
+
+        def _process_goal_group(self, tensors):
+            if not tensors:
+                return tensors
+            processed = self._process_obs_group(tensors)
+            sanitized = OrderedDict()
+            for key, tensor in processed.items():
+                target_shape = self.goal_shapes.get(key)
+                if target_shape is None:
+                    sanitized[key] = tensor
+                    continue
+                target_ndim = len(target_shape) + 1
+                while tensor.dim() > target_ndim and tensor.shape[1] == 1:
+                    tensor = tensor.squeeze(1)
+                sanitized[key] = tensor
+            return sanitized
+
+        def _unnormalize_actions(self, actions):
+            if (self.act_offset is None) or (self.act_scale is None):
+                return actions
+            adict = {"actions": actions}
+            stats = {"actions": {"offset": self.act_offset, "scale": self.act_scale}}
+            ObsUtils.unnormalize_dict(adict, stats)
+            return adict["actions"]
+
+        def _run_diffusion(self, obs_dict, goal_dict):
+            inputs = {"obs": obs_dict, "goal": goal_dict}
+            for key in self.obs_shapes:
+                tensor = inputs["obs"][key]
+                if tensor.ndim - 1 == len(self.obs_shapes[key]):
+                    inputs["obs"][key] = tensor.unsqueeze(1)
+                assert inputs["obs"][key].ndim - 2 == len(self.obs_shapes[key])
+            obs_features = TensorUtils.time_distributed(inputs, self.obs_encoder, inputs_as_kwargs=True)
+            assert obs_features.ndim == 3
+            batch = obs_features.shape[0]
+            obs_cond = obs_features.flatten(start_dim=1)
+
+            noise = torch.randn((batch, self.prediction_horizon, self.action_dim), device=obs_cond.device, dtype=obs_cond.dtype)
+            naction = noise
+
+            for k in self.timesteps:
+                noise_pred = self.noise_pred_net(sample=naction, timestep=k, global_cond=obs_cond)
+                naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
+
+            end = self.start_index + self.action_horizon
+            return naction[:, self.start_index:end]
+
+        def forward(self, *tensors):
+            idx = 0
+            obs_inputs = tensors[idx: idx + len(self.obs_keys)]
+            idx += len(self.obs_keys)
+            obs_dict = self._build_obs_dict(self.obs_keys, obs_inputs)
+            obs_dict = self._process_obs_group(obs_dict)
+
+            goal_dict = None
+            if len(self.goal_keys) > 0:
+                goal_inputs = tensors[idx: idx + len(self.goal_keys)]
+                idx += len(self.goal_keys)
+                goal_dict = self._build_obs_dict(self.goal_keys, goal_inputs)
+                goal_dict = self._process_goal_group(goal_dict)
+
+            cached_actions = tensors[idx]
+            cache_index = tensors[idx + 1]
+
+            if cached_actions.dim() == 2:
+                cached_actions = cached_actions.unsqueeze(0)
+            cache_index = cache_index.view(cached_actions.shape[0]).long()
+            cache_index = torch.clamp(cache_index, min=0)
+            cached_actions = TensorUtils.to_float(cached_actions)
+
+            new_actions = self._run_diffusion(obs_dict, goal_dict)
+            new_actions = self._unnormalize_actions(new_actions)
+
+            needs_refresh = cache_index >= self.action_horizon
+            refresh_mask = needs_refresh.view(-1, 1, 1)
+            combined_actions = torch.where(refresh_mask, new_actions, cached_actions)
+
+            gather_index = torch.where(needs_refresh, torch.zeros_like(cache_index), torch.clamp(cache_index, max=self.action_horizon - 1))
+            gather_index = gather_index.view(-1, 1, 1).repeat(1, 1, self.action_dim)
+            action = torch.gather(combined_actions, 1, gather_index).squeeze(1)
+
+            next_index = torch.where(needs_refresh, torch.ones_like(cache_index), cache_index + 1)
+            next_index = torch.clamp(next_index, max=self.action_horizon)
+
+            return action, combined_actions, next_index
+
+    action_dim = int(inner.ac_dim)
+    wrapper = DiffusionOnnxPolicy(
+        obs_encoder=obs_encoder,
+        noise_pred_net=noise_pred_net,
+        noise_scheduler=noise_scheduler,
+        timesteps=timesteps,
+        obs_keys=obs_keys,
+        goal_keys=goal_keys,
+        obs_shapes=obs_shapes,
+        goal_shapes=goal_shapes,
+        obs_norm_stats=obs_norm_stats,
+        action_norm=action_norm,
+        action_horizon=action_horizon,
+        observation_horizon=observation_horizon,
+        prediction_horizon=prediction_horizon,
+        action_dim=action_dim,
+    ).cpu().eval()
+
+    print(f"[wrap_policy] Diffusion wrapper ready - obs: {obs_keys} | goal: {goal_keys} | action_horizon: {action_horizon}")
+    if obs_norm_stats:
+        print("[wrap_policy] Observation normalization baked into diffusion wrapper")
+    else:
+        print("[wrap_policy] Diffusion wrapper expects pre-normalized observations")
+    if action_norm is not None:
+        print("[wrap_policy] Action unnormalization enabled for diffusion wrapper")
+    else:
+        print("[wrap_policy] Diffusion wrapper will output normalized actions ([-1, 1])")
+
+    is_recurrent = False
+    return wrapper, obs_keys, goal_keys, is_recurrent
+
 def create_dummy_inputs(wrapper, obs_keys, goal_keys, is_recurrent, config):
-    """
+    '''
     Build fixed-size zero tensors for export. All dimensions-including batch
     and sequence length-are constant, so OpenCV DNN will load the file.
-    """
+    '''
     import torch
 
+    is_recurrent = bool(getattr(wrapper, "is_recurrent", is_recurrent))
     batch = 1
-    seq = 1
+    seq = max(1, int(getattr(wrapper, "observation_horizon", 1)))
 
     def _raw_shape(key, processed_shape):
         modality = ObsUtils.OBS_KEYS_TO_MODALITIES.get(key) if ObsUtils.OBS_KEYS_TO_MODALITIES else None
@@ -424,11 +670,21 @@ def create_dummy_inputs(wrapper, obs_keys, goal_keys, is_recurrent, config):
             torch.zeros((num_layers, batch, hidden_size), dtype=torch.float32),  # c0
         ])
 
+    if getattr(wrapper, "requires_action_cache", False):
+        action_horizon = int(getattr(wrapper, "action_horizon", 1))
+        action_dim = int(getattr(wrapper, "action_dim", 1))
+        cache = torch.zeros((batch, action_horizon, action_dim), dtype=torch.float32)
+        cache_index = torch.full((batch,), action_horizon, dtype=torch.long)
+        dummy_inputs.extend([cache, cache_index])
+
     input_names = [f"obs::{k}" for k in obs_keys] + [f"goal::{k}" for k in goal_keys]
     if is_recurrent:
         input_names += ["h0", "c0"]
+    if getattr(wrapper, "requires_action_cache", False):
+        input_names += ["cached_actions", "cache_index"]
 
-    output_names = ["actions"] + (["h1", "c1"] if is_recurrent else [])
+    default_outputs = ["actions"] + (["h1", "c1"] if is_recurrent else [])
+    output_names = getattr(wrapper, "output_names", default_outputs)
 
     dyn_axes = None  # fully-static shapes
 
@@ -475,10 +731,11 @@ def main():
           {k: list(ckpt_dict[k].keys()) for k in ckpt_dict if isinstance(ckpt_dict[k], dict) and "norm" in k.lower()})
 
     action_norm = extract_action_normalization(ckpt_dict)
-    wrapper, obs_keys, goal_keys, is_recurrent = wrap_policy(policy, config, action_norm or {})
+    wrapper, obs_keys, goal_keys, is_recurrent = wrap_policy(policy, config, action_norm or {}, ckpt_dict)
     dummy_inputs, input_names, output_names, dyn_axes = create_dummy_inputs(wrapper, obs_keys, goal_keys, is_recurrent, config)
     export_to_onnx(wrapper, dummy_inputs, input_names, output_names, dyn_axes, onnx_path)
 
 
 if __name__ == '__main__':
     main()
+
