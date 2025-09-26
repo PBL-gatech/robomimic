@@ -2,7 +2,6 @@
 Implementation of Diffusion Policy https://diffusion-policy.cs.columbia.edu/ by Cheng Chi
 """
 from typing import Callable, Union
-import copy
 import math
 from collections import OrderedDict, deque
 from packaging.version import parse as parse_version
@@ -48,31 +47,6 @@ def algo_config_to_class(algo_config):
         raise NotImplementedError()
     else:
         raise RuntimeError()
-
-
-class DiffusionPolicyEMA:
-    """Wrapper to keep an EMA copy of the policy networks across diffusers versions."""
-
-    def __init__(self, module: nn.Module, **ema_kwargs):
-        self._ema_impl = EMAModel(parameters=module.parameters(), **ema_kwargs)
-        self.averaged_model = copy.deepcopy(module)
-        self._ema_impl.copy_to(self.averaged_model.parameters())
-        self.averaged_model.eval()
-
-    def to(self, device=None):
-        self._ema_impl.to(device=device)
-        if device is not None:
-            self.averaged_model = self.averaged_model.to(device)
-        return self
-
-    def step(self, module: nn.Module):
-        self._ema_impl.step(module.parameters())
-        self._ema_impl.copy_to(self.averaged_model.parameters())
-        self.averaged_model.eval()
-
-    def __getattr__(self, item):
-        return getattr(self._ema_impl, item)
-
 
 class DiffusionPolicyUNet(PolicyAlgo):
     def _create_networks(self):
@@ -135,23 +109,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # setup EMA
         ema = None
         if self.algo_config.ema.enabled:
-            ema_cfg = self.algo_config.ema
-            ema_kwargs = {}
-            if "power" in ema_cfg:
-                ema_kwargs["power"] = ema_cfg.power
-            else:
-                ema_kwargs["power"] = 2 / 3
-
-            if "use_ema_warmup" in ema_cfg:
-                ema_kwargs["use_ema_warmup"] = ema_cfg.use_ema_warmup
-            else:
-                ema_kwargs["use_ema_warmup"] = True
-
-            for attr in ("decay", "min_decay", "update_after_step", "inv_gamma", "foreach"):
-                if attr in ema_cfg:
-                    ema_kwargs[attr] = ema_cfg[attr]
-
-            ema = DiffusionPolicyEMA(nets, **ema_kwargs).to(self.device)
+            ema = EMAModel(model=nets, power=self.algo_config.ema.power)
 
         # set attrs
         self.nets = nets
