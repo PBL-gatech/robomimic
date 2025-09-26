@@ -1,4 +1,4 @@
-# env_patcher.py
+﻿# env_patcher.py
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -74,7 +74,7 @@ class EnvPatcher(EB.EnvBase):
 
         with h5py.File(self.dataset_path, "r") as h5:
             if demo_id is None:
-                demo_id = sorted(h5["data"].keys())[0]
+                demo_id = sorted(h5["data"].keys())[2] # make sure it is same as in run_PatcherBot_agent.py for now
             self._demo_id = demo_id
             print(f"[EnvPatcher] loading demo_id={self._demo_id} from {self.dataset_path}")
             obs_group_path = f"data/{demo_id}/obs"
