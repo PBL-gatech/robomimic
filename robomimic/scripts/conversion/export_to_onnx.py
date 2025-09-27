@@ -17,12 +17,7 @@ from robomimic.utils import obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 
 
-# Default folder used when no CLI args are provided (pointing to repo root)
-# DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot' / 'v0_029' / '20250831172330'
-# DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot' / 'v0_035' / '20250917152411' 
-# DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot' / 'v0_036' / '20250918011750'
-# DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot' / 'v0_037' / '20250921164912'
-DEFAULT_FOLDER = pathlib.Path(__file__).parent.parent.parent.parent / 'bc_patcherBot' / 'v0_038' / '20250921221249'
+df_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_003\20250926082848"
 
 
 def parse_args():
@@ -30,7 +25,7 @@ def parse_args():
     parser.add_argument("--ckpt", help="Path to .pth checkpoint")
     parser.add_argument("--config", help="Path to config.json")
     parser.add_argument("--out", help="Output ONNX file")
-    parser.add_argument("--folder", help="Path to folder containing checkpoint and config", default=str(DEFAULT_FOLDER))
+    parser.add_argument("--folder", help="Path to folder containing checkpoint and config", default=df_path)
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device to use")
     args = parser.parse_args()
     print(f"[*] Parsed arguments: {args}")
@@ -163,8 +158,8 @@ def extract_action_normalization(ckpt_dict):
     scale = _to_1d_np(scale)
     dim = int(offset.shape[0])
 
-    offset_t = torch.from_numpy(offset).view(1, 1, dim)
-    scale_t = torch.from_numpy(scale).view(1, 1, dim)
+    offset_t = torch.from_numpy(offset).view(1, dim)
+    scale_t = torch.from_numpy(scale).view(1, dim)
 
     return {"actions": {"offset": offset_t, "scale": scale_t}}
 
@@ -203,6 +198,155 @@ def extract_obs_normalization(policy, obs_keys, goal_keys):
         print(f"[extract_obs_normalization] Missing stats for keys: {sorted(missing)}")
     print(f"[extract_obs_normalization] Loaded stats for keys: {list(tensor_stats.keys())}")
     return tensor_stats
+
+
+
+def _unnormalize_actions_tensor(actions, offset, scale):
+    """Broadcast action normalization buffers to match actions and apply affine transform."""
+    if offset is None or scale is None:
+        return actions
+    device = actions.device
+    dtype = actions.dtype
+    offset_t = offset.to(device=device, dtype=dtype)
+    scale_t = scale.to(device=device, dtype=dtype)
+    if offset_t.dim() < actions.dim():
+        view_shape = (1,) * (actions.dim() - offset_t.dim()) + tuple(offset_t.shape)
+        offset_t = offset_t.view(*view_shape)
+        scale_t = scale_t.view(*view_shape)
+    offset_t = offset_t.expand_as(actions)
+    scale_t = scale_t.expand_as(actions)
+    return actions * scale_t + offset_t
+
+
+def _is_tracing_or_onnx_export():
+    """Return True when torch tracing or ONNX export is active."""
+    if torch.jit.is_tracing():
+        return True
+    is_in_onnx_export = getattr(torch.onnx, "is_in_onnx_export", None)
+    if callable(is_in_onnx_export):
+        try:
+            if is_in_onnx_export():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _apply_tracing_safe_overrides():
+    """Patch selected robomimic utilities to avoid tracer warnings during ONNX export."""
+    if getattr(_apply_tracing_safe_overrides, "_applied", False):
+        return
+    _apply_tracing_safe_overrides._applied = True
+
+    from robomimic.utils import obs_utils as _ObsUtils
+    import robomimic.utils.tensor_utils as _TensorUtils
+    from robomimic.models import base_nets as _BaseNets
+    from robomimic.models import obs_core as _ObsCore
+
+    original_center_crop = _ObsUtils.center_crop
+
+    def _center_crop_safe(im, t_h, t_w):
+        if not _is_tracing_or_onnx_export():
+            return original_center_crop(im, t_h, t_w)
+        crop_h = (im.shape[-3] - t_h) // 2
+        crop_w = (im.shape[-2] - t_w) // 2
+        return im[..., crop_h:crop_h + t_h, crop_w:crop_w + t_w, :]
+
+    _ObsUtils.center_crop = _center_crop_safe
+
+    original_process_frame = _ObsUtils.process_frame
+
+    def _process_frame_safe(frame, channel_dim, scale):
+        if not _is_tracing_or_onnx_export():
+            return original_process_frame(frame, channel_dim, scale)
+        frame = _TensorUtils.to_float(frame)
+        if scale is not None:
+            frame = frame / scale
+            frame = frame.clamp(0.0, 1.0)
+        return _ObsUtils.batch_image_hwc_to_chw(frame)
+
+    _ObsUtils.process_frame = _process_frame_safe
+
+    original_normalize_dict = _ObsUtils.normalize_dict
+
+    def _normalize_dict_safe(data_dict, normalization_stats):
+        if not _is_tracing_or_onnx_export():
+            return original_normalize_dict(data_dict, normalization_stats)
+        for key, value in data_dict.items():
+            stats = normalization_stats[key]
+            offset = stats["offset"][0]
+            scale = stats["scale"][0]
+            while offset.dim() < value.dim():
+                offset = offset.unsqueeze(0)
+                scale = scale.unsqueeze(0)
+            data_dict[key] = (value - offset) / scale
+        return data_dict
+
+    _ObsUtils.normalize_dict = _normalize_dict_safe
+
+    original_unnormalize_dict = _ObsUtils.unnormalize_dict
+
+    def _unnormalize_dict_safe(data_dict, normalization_stats):
+        if not _is_tracing_or_onnx_export():
+            return original_unnormalize_dict(data_dict, normalization_stats)
+        for key, value in data_dict.items():
+            stats = normalization_stats[key]
+            offset = stats["offset"]
+            scale = stats["scale"]
+            while offset.dim() < value.dim():
+                offset = offset.unsqueeze(0)
+                scale = scale.unsqueeze(0)
+            data_dict[key] = (value * scale) + offset
+        return data_dict
+
+    _ObsUtils.unnormalize_dict = _unnormalize_dict_safe
+
+    original_convbase_forward = _BaseNets.ConvBase.forward
+
+    def _convbase_forward_safe(self, inputs):
+        if _is_tracing_or_onnx_export():
+            return self.nets(inputs)
+        return original_convbase_forward(self, inputs)
+
+    _BaseNets.ConvBase.forward = _convbase_forward_safe
+
+    if hasattr(_BaseNets, "SpatialSoftmax"):
+        original_spatial_forward = _BaseNets.SpatialSoftmax.forward
+
+        def _spatial_forward_safe(self, feature):
+            if not _is_tracing_or_onnx_export():
+                return original_spatial_forward(self, feature)
+            if self.nets is not None:
+                feature = self.nets(feature)
+            feature = feature.reshape(-1, self._in_h * self._in_w)
+            attention = torch.softmax(feature / self.temperature, dim=-1)
+            expected_x = torch.sum(self.pos_x * attention, dim=1, keepdim=True)
+            expected_y = torch.sum(self.pos_y * attention, dim=1, keepdim=True)
+            expected_xy = torch.cat([expected_x, expected_y], 1)
+            feature_keypoints = expected_xy.view(-1, self._num_kp, 2)
+            if self.training:
+                feature_keypoints = feature_keypoints + torch.randn_like(feature_keypoints) * self.noise_std
+            if self.output_variance:
+                expected_xx = torch.sum(self.pos_x * self.pos_x * attention, dim=1, keepdim=True)
+                expected_yy = torch.sum(self.pos_y * self.pos_y * attention, dim=1, keepdim=True)
+                expected_xy_cov = torch.sum(self.pos_x * self.pos_y * attention, dim=1, keepdim=True)
+                var_x = expected_xx - expected_x * expected_x
+                var_y = expected_yy - expected_y * expected_y
+                var_xy = expected_xy_cov - expected_x * expected_y
+                covar = torch.cat([var_x, var_xy, var_xy, var_y], 1).reshape(-1, self._num_kp, 2, 2)
+                feature_keypoints = (feature_keypoints, covar)
+            return feature_keypoints
+
+        _BaseNets.SpatialSoftmax.forward = _spatial_forward_safe
+
+    original_visualcore_forward = _ObsCore.VisualCore.forward
+
+    def _visualcore_forward_safe(self, inputs):
+        if _is_tracing_or_onnx_export():
+            return _BaseNets.ConvBase.forward(self, inputs)
+        return original_visualcore_forward(self, inputs)
+
+    _ObsCore.VisualCore.forward = _visualcore_forward_safe
 
 
 def wrap_policy(policy, config, action_norm_stats, ckpt_dict):
@@ -305,12 +449,7 @@ def wrap_standard_policy(policy_obj, config, action_norm_stats):
             return actions
 
         def _unnormalize_actions(self, actions):
-            if (self.act_offset is None) or (self.act_scale is None):
-                return actions
-            adict = {"actions": actions}
-            stats = {"actions": {"offset": self.act_offset, "scale": self.act_scale}}
-            ObsUtils.unnormalize_dict(adict, stats)
-            return adict["actions"]
+            return _unnormalize_actions_tensor(actions, self.act_offset, self.act_scale)
 
         def _build_obs_dict(self, keys, tensors):
             return OrderedDict((k, v) for k, v in zip(keys, tensors))
@@ -443,14 +582,17 @@ def wrap_diffusion_policy(policy_obj, action_norm_stats):
         timesteps = torch.tensor(list(timesteps), dtype=torch.long)
     else:
         timesteps = timesteps.clone().to(torch.long)
+    timesteps_list = tuple(int(t) for t in timesteps.view(-1).tolist())
 
     class DiffusionOnnxPolicy(nn.Module):
-        def __init__(self, obs_encoder, noise_pred_net, noise_scheduler, timesteps, obs_keys, goal_keys, obs_shapes, goal_shapes, obs_norm_stats, action_norm, action_horizon, observation_horizon, prediction_horizon, action_dim):
+        def __init__(self, obs_encoder, noise_pred_net, noise_scheduler, timesteps, timesteps_list, obs_keys, goal_keys, obs_shapes, goal_shapes, obs_norm_stats, action_norm, action_horizon, observation_horizon, prediction_horizon, action_dim, num_inference_timesteps):
             super().__init__()
             self.obs_encoder = obs_encoder
             self.noise_pred_net = noise_pred_net
             self.noise_scheduler = noise_scheduler
             self.register_buffer("timesteps", timesteps)
+            self.timesteps_list = timesteps_list
+            self.num_inference_timesteps = num_inference_timesteps
 
             self.obs_keys = obs_keys
             self.goal_keys = goal_keys
@@ -527,12 +669,7 @@ def wrap_diffusion_policy(policy_obj, action_norm_stats):
             return sanitized
 
         def _unnormalize_actions(self, actions):
-            if (self.act_offset is None) or (self.act_scale is None):
-                return actions
-            adict = {"actions": actions}
-            stats = {"actions": {"offset": self.act_offset, "scale": self.act_scale}}
-            ObsUtils.unnormalize_dict(adict, stats)
-            return adict["actions"]
+            return _unnormalize_actions_tensor(actions, self.act_offset, self.act_scale)
 
         def _run_diffusion(self, obs_dict, goal_dict):
             inputs = {"obs": obs_dict, "goal": goal_dict}
@@ -540,18 +677,21 @@ def wrap_diffusion_policy(policy_obj, action_norm_stats):
                 tensor = inputs["obs"][key]
                 if tensor.ndim - 1 == len(self.obs_shapes[key]):
                     inputs["obs"][key] = tensor.unsqueeze(1)
-                assert inputs["obs"][key].ndim - 2 == len(self.obs_shapes[key])
+                elif not _is_tracing_or_onnx_export():
+                    assert inputs["obs"][key].ndim - 2 == len(self.obs_shapes[key])
             obs_features = TensorUtils.time_distributed(inputs, self.obs_encoder, inputs_as_kwargs=True)
-            assert obs_features.ndim == 3
+            if not _is_tracing_or_onnx_export():
+                assert obs_features.ndim == 3
             batch = obs_features.shape[0]
             obs_cond = obs_features.flatten(start_dim=1)
 
             noise = torch.randn((batch, self.prediction_horizon, self.action_dim), device=obs_cond.device, dtype=obs_cond.dtype)
             naction = noise
 
-            for k in self.timesteps:
-                noise_pred = self.noise_pred_net(sample=naction, timestep=k, global_cond=obs_cond)
-                naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
+            self.noise_scheduler.set_timesteps(self.num_inference_timesteps)
+            for timestep in self.timesteps_list:
+                noise_pred = self.noise_pred_net(sample=naction, timestep=timestep, global_cond=obs_cond)
+                naction = self.noise_scheduler.step(model_output=noise_pred, timestep=timestep, sample=naction).prev_sample
 
             end = self.start_index + self.action_horizon
             return naction[:, self.start_index:end]
@@ -601,6 +741,7 @@ def wrap_diffusion_policy(policy_obj, action_norm_stats):
         noise_pred_net=noise_pred_net,
         noise_scheduler=noise_scheduler,
         timesteps=timesteps,
+        timesteps_list=timesteps_list,
         obs_keys=obs_keys,
         goal_keys=goal_keys,
         obs_shapes=obs_shapes,
@@ -611,6 +752,7 @@ def wrap_diffusion_policy(policy_obj, action_norm_stats):
         observation_horizon=observation_horizon,
         prediction_horizon=prediction_horizon,
         action_dim=action_dim,
+        num_inference_timesteps=num_inference_timesteps,
     ).cpu().eval()
 
     print(f"[wrap_policy] Diffusion wrapper ready - obs: {obs_keys} | goal: {goal_keys} | action_horizon: {action_horizon}")
@@ -715,6 +857,7 @@ def export_to_onnx(wrapper, dummy_inputs, input_names, output_names, dyn_axes, o
 
 def main():
     args = parse_args()
+    _apply_tracing_safe_overrides()
     if not (args.folder or (args.ckpt and args.config)):
         raise ValueError("Either --folder or both --ckpt and --config must be provided")
 
