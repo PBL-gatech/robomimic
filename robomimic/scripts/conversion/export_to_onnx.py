@@ -17,7 +17,11 @@ from robomimic.utils import obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 
 
-df_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_003\20250926082848"
+# df_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_004\20250927024406"
+# bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_003\20250926165240"
+# bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_001\20250925220945"
+# bc_path =r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_005\20250928193451"
+bc_path =r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\NeuronHunting\v0_041\20250928212815"
 
 
 def parse_args():
@@ -25,7 +29,7 @@ def parse_args():
     parser.add_argument("--ckpt", help="Path to .pth checkpoint")
     parser.add_argument("--config", help="Path to config.json")
     parser.add_argument("--out", help="Output ONNX file")
-    parser.add_argument("--folder", help="Path to folder containing checkpoint and config", default=df_path)
+    parser.add_argument("--folder", help="Path to folder containing checkpoint and config", default=bc_path)
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device to use")
     args = parser.parse_args()
     print(f"[*] Parsed arguments: {args}")
@@ -242,6 +246,8 @@ def _apply_tracing_safe_overrides():
     import robomimic.utils.tensor_utils as _TensorUtils
     from robomimic.models import base_nets as _BaseNets
     from robomimic.models import obs_core as _ObsCore
+    import torch
+    import numpy as _np
 
     original_center_crop = _ObsUtils.center_crop
 
@@ -347,6 +353,25 @@ def _apply_tracing_safe_overrides():
         return original_visualcore_forward(self, inputs)
 
     _ObsCore.VisualCore.forward = _visualcore_forward_safe
+
+    original_moveaxis = torch.Tensor.moveaxis
+
+    def _moveaxis_safe(tensor, source, destination):
+        if not _is_tracing_or_onnx_export():
+            return original_moveaxis(tensor, source, destination)
+        ndim = tensor.dim()
+        src_axes = _np.atleast_1d(_np.array(source, dtype=int)).tolist()
+        dst_axes = _np.atleast_1d(_np.array(destination, dtype=int)).tolist()
+        src_axes = [axis + ndim if axis < 0 else axis for axis in src_axes]
+        dst_axes = [axis + ndim if axis < 0 else axis for axis in dst_axes]
+        if len(src_axes) != len(dst_axes):
+            raise ValueError('source and destination must have the same number of axes')
+        perm = [axis for axis in range(ndim) if axis not in src_axes]
+        for dest_axis, src_axis in sorted(zip(dst_axes, src_axes)):
+            perm.insert(dest_axis, src_axis)
+        return tensor.permute(*perm)
+
+    torch.Tensor.moveaxis = _moveaxis_safe
 
 
 def wrap_policy(policy, config, action_norm_stats, ckpt_dict):
