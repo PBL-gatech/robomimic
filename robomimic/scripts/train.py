@@ -282,7 +282,7 @@ def train(config, device, resume=False):
         # Evaluate the model on validation set
         if config.experiment.validate:
             with torch.no_grad():
-                step_log = TrainUtils.run_epoch(model=model, data_loader=valid_loader, epoch=epoch, validate=True, num_steps=valid_num_steps)
+                step_log = TrainUtils.run_epoch(model=model, data_loader=valid_loader, epoch=epoch, validate=True, num_steps=valid_num_steps, obs_normalization_stats=obs_normalization_stats)
             for k, v in step_log.items():
                 if k.startswith("Time_"):
                     data_logger.record("Timing_Stats/Valid_{}".format(k[5:]), v, epoch)
@@ -467,10 +467,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\bc-PatcherBot_v0_040.json", # neuron hunting with lstm
+        # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\NeuronHunting\bc\bc-PatcherBot_v0_041.json", # neuron hunting with lstm
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\df-PatcherBot_v0_003.json", # neuron hunting with diffusion
-        # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\bc\bc-PatcherBot_v0_003.json", # pipette finding with lstm
-        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_004.json", # pipette finding with diffusion
+        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\bc\bc-PatcherBot_v0_007.json", # pipette finding with lstm
+        # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_004.json", # pipette finding with diffusion
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
     )
