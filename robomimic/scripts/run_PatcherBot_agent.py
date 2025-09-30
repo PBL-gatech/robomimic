@@ -260,14 +260,14 @@ def _summarize_losses(loss_totals: Dict[str, list]) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_003\20250926082848\last.pth",  help="Path to .pth checkpoint")
-    ap.add_argument("--dataset", required=False,default = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_dataset_v0_002\PatcherBot_dataset_v0_002_find_pipette.hdf5",  help="Path to .hdf5")
+    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_009\20250930123649\last.pth",  help="Path to .pth checkpoint")
+    ap.add_argument("--dataset", required=False,default = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_007\PatcherBot_test_dataset_v0_007_find_pipette.hdf5",  help="Path to .hdf5")
     ap.add_argument("--horizon", type=int, default=None)
     ap.add_argument("--frame_stack", type=int, default=None, help="Frame stack override; defaults to policy config")
     ap.add_argument("--eps", type=float, default=-1.0)
     ap.add_argument("--show_pos_traj", action="store_true", default = True,help="compute positional trajectory error like HuntTester")
-    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\results_df_PatcherBot_v0_003.csv", help="Optional path to save per-step action errors as CSV")
-    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\metadata_df_PatcherBot_v0_003.json", help="Optional path to save rollout metadata as JSON")
+    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\results_df_PatcherBot_v0_009.csv", help="Optional path to save per-step action errors as CSV")
+    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\metadata_df_PatcherBot_v0_009.json", help="Optional path to save rollout metadata as JSON")
     args = ap.parse_args()
 
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
@@ -376,6 +376,8 @@ def main():
         gt_action = np.asarray(env._actions_gt[min(step_idx, env._actions_gt.shape[0] - 1)], dtype=np.float32).reshape(-1)
         act_raw = policy(ob=obs, goal=goal)
         act = _extract_policy_action(act_raw)
+        if act.shape[0] != gt_action.shape[0]:
+            raise ValueError(f"[run_PatcherBot_agent] action dimension mismatch: policy {act.shape[0]} vs dataset {gt_action.shape[0]} at step {step_idx}")
         print(f"act={act}")
         obs, r, done, info = env.step(act)
         errs.append(info["error_l2"])
@@ -513,3 +515,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

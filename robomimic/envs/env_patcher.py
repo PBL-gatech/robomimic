@@ -1,4 +1,4 @@
-﻿# env_patcher.py
+# env_patcher.py
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -393,7 +393,8 @@ class EnvPatcher(EB.EnvBase):
     def step(self, action: np.ndarray):
         act_pred = np.asarray(action, dtype=np.float32).reshape(-1)
         act_gt = np.asarray(self._actions_gt[self._t], dtype=np.float32).reshape(-1)
-
+        if act_pred.shape[0] != act_gt.shape[0]:
+            raise ValueError(f"[EnvPatcher.step] action dimension mismatch: predicted {act_pred.shape[0]} vs dataset {act_gt.shape[0]} at step {self._t}")
         err_vec = act_pred - act_gt
         err = float(np.linalg.norm(err_vec, ord=2))
         self._latest_error = err
@@ -500,3 +501,7 @@ def create_env_patcher(dataset_path: str, *, frame_stack: int = 1, **kwargs):
         setattr(wrapped, "frame_stack", frame_stack)
         return wrapped
     return base
+
+
+
+
