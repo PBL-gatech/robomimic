@@ -4,9 +4,10 @@ import csv
 import json
 import statistics
 from collections import defaultdict
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, List
 from pathlib import Path
 from datetime import datetime
+from glob import glob
 
 import h5py
 import numpy as np
@@ -32,6 +33,23 @@ def _to_list(value: Optional[Iterable]) -> list:
         return list(value)
     return [value]
 
+
+
+
+def _resolve_checkpoints(agent_arg: str) -> Sequence[Path]:
+    path_str = str(Path(agent_arg).expanduser())
+    direct_path = Path(path_str)
+    paths: List[Path] = []
+    if direct_path.is_file():
+        paths = [direct_path]
+    elif direct_path.is_dir():
+        paths = sorted(p for p in direct_path.glob("*.pth") if p.is_file())
+    else:
+        matched = sorted(Path(p) for p in glob(path_str))
+        paths = [p for p in matched if p.is_file()]
+    if not paths:
+        raise FileNotFoundError(f"No checkpoints found for {agent_arg}")
+    return paths
 
 def _extract_obs_modalities(cfg) -> Dict[str, list]:
     obs_cfg = _safe_get(_safe_get(cfg.observation, "modalities"), "obs")
@@ -258,261 +276,324 @@ def _summarize_losses(loss_totals: Dict[str, list]) -> str:
     return " | ".join(parts)
 
 
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_009\20250930123649\last.pth",  help="Path to .pth checkpoint")
+    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_009\20250930123649\models",  help="Path to .pth checkpoint")
     ap.add_argument("--dataset", required=False,default = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_007\PatcherBot_test_dataset_v0_007_find_pipette.hdf5",  help="Path to .hdf5")
     ap.add_argument("--horizon", type=int, default=None)
     ap.add_argument("--frame_stack", type=int, default=None, help="Frame stack override; defaults to policy config")
     ap.add_argument("--eps", type=float, default=-1.0)
     ap.add_argument("--show_pos_traj", action="store_true", default = True,help="compute positional trajectory error like HuntTester")
-    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\results_df_PatcherBot_v0_009.csv", help="Optional path to save per-step action errors as CSV")
-    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\metadata_df_PatcherBot_v0_009.json", help="Optional path to save rollout metadata as JSON")
+    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_009\results_bc_PatcherBot_v0_009_5.csv", help="Optional path to save per-step action errors as CSV")
+    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_009\metadata_bc_PatcherBot_v0_009_5.json", help="Optional path to save rollout metadata as JSON")
     args = ap.parse_args()
 
+    ckpt_paths = _resolve_checkpoints(args.agent)
+    multi_ckpt = len(ckpt_paths) > 1
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
-    policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=args.agent, device=device, verbose=True)
-    cfg, _ = FileUtils.config_from_checkpoint(ckpt_path=args.agent, ckpt_dict=ckpt_dict)
 
-    algo_name = str(ckpt_dict.get("algo_name", "")).lower()
-    print(f"[INFO] loaded algorithm: {algo_name or 'unknown'}")
+    per_step_csv_target = Path(args.per_step_csv).expanduser() if args.per_step_csv else None
+    all_per_step_records = []
+    summary_rows = []
 
-    loss_cfg = None
-    loss_section = _safe_get(cfg.algo, "loss")
-    if loss_section is not None:
-        if hasattr(loss_section, "to_dict"):
-            loss_cfg = loss_section.to_dict()
-        elif isinstance(loss_section, Mapping):
-            loss_cfg = dict(loss_section)
+    for idx, ckpt_path in enumerate(ckpt_paths, start=1):
+        print(f"[INFO] evaluating checkpoint {ckpt_path} ({idx}/{len(ckpt_paths)})")
+        policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=str(ckpt_path), device=device, verbose=True)
+        cfg, _ = FileUtils.config_from_checkpoint(ckpt_path=str(ckpt_path), ckpt_dict=ckpt_dict)
 
+        algo_name = str(ckpt_dict.get("algo_name", "")).lower()
+        print(f"[INFO] loaded algorithm: {algo_name or 'unknown'}")
 
-    policy_frame_stack = None
-    policy_impl = getattr(policy, "policy", None)
-    if policy_impl is not None:
-        cfg_policy = getattr(policy_impl, "global_config", None)
-        if cfg_policy is not None:
-            try:
-                cfg_stack = getattr(cfg_policy.train, "frame_stack", None)
-                if cfg_stack is not None:
-                    policy_frame_stack = int(cfg_stack)
-            except AttributeError:
-                policy_frame_stack = None
+        loss_cfg = None
+        loss_section = _safe_get(cfg.algo, "loss")
+        if loss_section is not None:
+            if hasattr(loss_section, "to_dict"):
+                loss_cfg = loss_section.to_dict()
+            elif isinstance(loss_section, Mapping):
+                loss_cfg = dict(loss_section)
 
-    if policy_frame_stack is None:
-        cfg_stack = getattr(cfg.train, "frame_stack", None)
-        if cfg_stack is not None:
-            policy_frame_stack = int(cfg_stack)
-
-    if policy_frame_stack is not None and policy_frame_stack <= 0:
         policy_frame_stack = None
+        policy_impl = getattr(policy, "policy", None)
+        if policy_impl is not None:
+            cfg_policy = getattr(policy_impl, "global_config", None)
+            if cfg_policy is not None:
+                try:
+                    cfg_stack = getattr(cfg_policy.train, "frame_stack", None)
+                    if cfg_stack is not None:
+                        policy_frame_stack = int(cfg_stack)
+                except AttributeError:
+                    policy_frame_stack = None
 
-    requested_stack = args.frame_stack if (args.frame_stack is not None and args.frame_stack > 0) else None
-    frame_stack = requested_stack or policy_frame_stack or 1
-    frame_stack = max(int(frame_stack), 1)
-    if requested_stack and policy_frame_stack and requested_stack != policy_frame_stack:
-        print(f"[WARN] overriding policy frame_stack={policy_frame_stack} with requested value {requested_stack}")
-    else:
-        print(f"[INFO] using frame_stack={frame_stack} (policy default: {policy_frame_stack or 'n/a'})")
+        if policy_frame_stack is None:
+            cfg_stack = getattr(cfg.train, "frame_stack", None)
+            if cfg_stack is not None:
+                policy_frame_stack = int(cfg_stack)
 
-    if args.horizon is None:
-        with h5py.File(args.dataset, "r") as h5:
-            demo_id = sorted(h5["data"].keys())[2] # make sure it is same in env_patcher.py for now
-            args.horizon = h5["data"][demo_id]["actions"].shape[0]
-        print(f"[INFO] setting horizon to {args.horizon} from demo length")
+        if policy_frame_stack is not None and policy_frame_stack <= 0:
+            policy_frame_stack = None
 
-    obs_modalities = _extract_obs_modalities(cfg)
-    rgb_keys = obs_modalities.get("rgb", [])
-    image_key = rgb_keys[0] if rgb_keys else "camera_image"
-    low_dim_keys = obs_modalities.get("low_dim", [])
-    pipette_key = next((k for k in low_dim_keys if "pipette" in k.lower()), "pipette_positions")
-    stage_key = next((k for k in low_dim_keys if "stage" in k.lower()), "stage_positions")
-    resistance_key = next((k for k in low_dim_keys if "resist" in k.lower()), "resistance")
-    _ensure_key_in_modalities(obs_modalities, image_key, "rgb")
-    _ensure_key_in_modalities(obs_modalities, pipette_key, "low_dim")
-    _ensure_key_in_modalities(obs_modalities, stage_key, "low_dim")
-    _ensure_key_in_modalities(obs_modalities, resistance_key, "low_dim")
+        requested_stack = args.frame_stack if (args.frame_stack is not None and args.frame_stack > 0) else None
+        frame_stack = requested_stack or policy_frame_stack or 1
+        frame_stack = max(int(frame_stack), 1)
+        if requested_stack and policy_frame_stack and requested_stack != policy_frame_stack:
+            print(f"[WARN] overriding policy frame_stack={policy_frame_stack} with requested value {requested_stack}")
+        else:
+            print(f"[INFO] using frame_stack={frame_stack} (policy default: {policy_frame_stack or 'n/a'})")
 
-    obs_key_specs = _build_obs_specs(cfg, ckpt_dict, obs_modalities)
+        horizon = args.horizon
+        if horizon is None:
+            with h5py.File(args.dataset, "r") as h5:
+                demo_id = sorted(h5["data"].keys())[0]  # make sure it is same in env_patcher.py for now
+                horizon = h5["data"][demo_id]["actions"].shape[0]
+            args.horizon = horizon
+            print(f"[INFO] setting horizon to {horizon} from demo length")
 
-    env = create_env_patcher(
-        dataset_path=args.dataset,
-        frame_stack=frame_stack,
-        success_epsilon=args.eps,
-        horizon=args.horizon,
-        image_key=image_key,
-        pipette_key=pipette_key,
-        stage_key=stage_key,
-        resistance_key=resistance_key,
-        obs_modalities=obs_modalities,
-        obs_key_specs=obs_key_specs,
-    )
-    env_frame_stack = getattr(env, "frame_stack", frame_stack)
+        obs_modalities = _extract_obs_modalities(cfg)
+        rgb_keys = obs_modalities.get("rgb", [])
+        image_key = rgb_keys[0] if rgb_keys else "camera_image"
+        low_dim_keys = obs_modalities.get("low_dim", [])
+        pipette_key = next((k for k in low_dim_keys if "pipette" in k.lower()), "pipette_positions")
+        stage_key = next((k for k in low_dim_keys if "stage" in k.lower()), "stage_positions")
+        resistance_key = next((k for k in low_dim_keys if "resist" in k.lower()), "resistance")
+        _ensure_key_in_modalities(obs_modalities, image_key, "rgb")
+        _ensure_key_in_modalities(obs_modalities, pipette_key, "low_dim")
+        _ensure_key_in_modalities(obs_modalities, stage_key, "low_dim")
+        _ensure_key_in_modalities(obs_modalities, resistance_key, "low_dim")
 
-    def _stack_goal_if_needed(goal_dict, stack):
-        if goal_dict is None or stack <= 1 or not isinstance(goal_dict, dict):
-            return goal_dict
-        stacked = {}
-        for key, value in goal_dict.items():
-            arr = np.asarray(value)
-            if arr.ndim == 0:
-                arr = np.repeat(arr[None], stack, axis=0)
-            elif arr.shape[0] != stack:
-                arr = np.repeat(arr[np.newaxis, ...], stack, axis=0)
-            stacked[key] = arr
-        return stacked
+        obs_key_specs = _build_obs_specs(cfg, ckpt_dict, obs_modalities)
 
-    policy.start_episode()
-    obs = env.reset()
-    state = env.get_state()
-    obs = env.reset_to(state)
-    goal = env.get_goal()
-    goal = _stack_goal_if_needed(goal, env_frame_stack)
+        env = create_env_patcher(
+            dataset_path=args.dataset,
+            frame_stack=frame_stack,
+            success_epsilon=args.eps,
+            horizon=horizon,
+            image_key=image_key,
+            pipette_key=pipette_key,
+            stage_key=stage_key,
+            resistance_key=resistance_key,
+            obs_modalities=obs_modalities,
+            obs_key_specs=obs_key_specs,
+        )
+        env_frame_stack = getattr(env, "frame_stack", frame_stack)
 
-    errs, rewards, acts = [], [], []
-    per_step_records = []
-    loss_totals: Dict[str, list] = defaultdict(lambda: [0.0, 0])
-    for _ in range(args.horizon):
-        step_idx = env._t
-        gt_action = np.asarray(env._actions_gt[min(step_idx, env._actions_gt.shape[0] - 1)], dtype=np.float32).reshape(-1)
-        act_raw = policy(ob=obs, goal=goal)
-        act = _extract_policy_action(act_raw)
-        if act.shape[0] != gt_action.shape[0]:
-            raise ValueError(f"[run_PatcherBot_agent] action dimension mismatch: policy {act.shape[0]} vs dataset {gt_action.shape[0]} at step {step_idx}")
-        print(f"act={act}")
-        obs, r, done, info = env.step(act)
-        errs.append(info["error_l2"])
-        rewards.append(r)
-        acts.append(act)
-        per_step_records.append(_build_step_record(step_idx, act, gt_action, info, r))
-        losses = _compute_loss_components(algo_name, loss_cfg, act, gt_action)
-        for name, value in losses.items():
-            total, count = loss_totals[name]
-            loss_totals[name] = [total + float(value), count + 1]
-        if done:
-            break
+        def _stack_goal_if_needed(goal_dict, stack):
+            if goal_dict is None or stack <= 1 or not isinstance(goal_dict, dict):
+                return goal_dict
+            stacked = {}
+            for key, value in goal_dict.items():
+                arr = np.asarray(value)
+                if arr.ndim == 0:
+                    arr = np.repeat(arr[None], stack, axis=0)
+                elif arr.shape[0] != stack:
+                    arr = np.repeat(arr[np.newaxis, ...], stack, axis=0)
+                stacked[key] = arr
+            return stacked
 
-    success_info = {}
-    try:
-        success_info = env.is_success()
-    except Exception:
+        policy.start_episode()
+        obs = env.reset()
+        state = env.get_state()
+        obs = env.reset_to(state)
+        goal = env.get_goal()
+        goal = _stack_goal_if_needed(goal, env_frame_stack)
+
+        errs, rewards, acts = [], [], []
+        per_step_records = []
+        loss_totals: Dict[str, list] = defaultdict(lambda: [0.0, 0])
+        for _ in range(int(horizon)):
+            step_idx = env._t
+            gt_action = np.asarray(env._actions_gt[min(step_idx, env._actions_gt.shape[0] - 1)], dtype=np.float32).reshape(-1)
+            act_raw = policy(ob=obs, goal=goal)
+            act = _extract_policy_action(act_raw)
+            if act.shape[0] != gt_action.shape[0]:
+                raise ValueError(f"[run_PatcherBot_agent] action dimension mismatch: policy {act.shape[0]} vs dataset {gt_action.shape[0]} at step {step_idx}")
+            print(f"act={act}")
+            obs, r, done, info = env.step(act)
+            errs.append(info["error_l2"])
+            rewards.append(r)
+            acts.append(act)
+            per_step_records.append(_build_step_record(step_idx, act, gt_action, info, r))
+            losses = _compute_loss_components(algo_name, loss_cfg, act, gt_action)
+            for name, value in losses.items():
+                total, count = loss_totals[name]
+                loss_totals[name] = [total + float(value), count + 1]
+            if done:
+                break
+
         success_info = {}
-    success_flag = bool(success_info.get("task", False))
+        try:
+            success_info = env.is_success()
+        except Exception:
+            success_info = {}
+        success_flag = bool(success_info.get("task", False))
 
-    steps_taken = len(errs)
-    mean_reward = statistics.mean(rewards) if rewards else None
-    l2_metrics = None
-    if errs:
-        l2_metrics = {
-            "mean": float(statistics.mean(errs)),
-            "median": float(np.median(errs)),
-            "p95": float(np.percentile(errs, 95)),
-        }
-        print(f"[RESULT] steps={steps_taken} | mean L2={l2_metrics['mean']:.6f} | median={l2_metrics['median']:.6f} | p95={l2_metrics['p95']:.6f}")
-        if mean_reward is not None:
+        steps_taken = len(errs)
+        mean_reward = statistics.mean(rewards) if rewards else None
+        l2_metrics = None
+        if errs:
+            l2_metrics = {
+                "mean": float(statistics.mean(errs)),
+                "median": float(np.median(errs)),
+                "p95": float(np.percentile(errs, 95)),
+            }
+            print(f"[RESULT] steps={steps_taken} | mean L2={l2_metrics['mean']:.6f} | median={l2_metrics['median']:.6f} | p95={l2_metrics['p95']:.6f}")
+            if mean_reward is not None:
+                print(f"[RESULT] mean reward={mean_reward:.6f} | success={success_flag}")
+        elif mean_reward is not None:
             print(f"[RESULT] mean reward={mean_reward:.6f} | success={success_flag}")
-    elif mean_reward is not None:
-        print(f"[RESULT] mean reward={mean_reward:.6f} | success={success_flag}")
-    if loss_totals:
-        print(f"[LOSS] {_summarize_losses(loss_totals)}")
+        loss_summary_text = _summarize_losses(loss_totals)
+        if loss_summary_text:
+            print(f"[LOSS] {loss_summary_text}")
 
-    per_step_csv_path = None
-    if args.per_step_csv and per_step_records:
-        csv_path = Path(args.per_step_csv).expanduser()
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = []
+        if args.show_pos_traj:
+            try:
+                seq_len = int(getattr(cfg.train, 'seq_length', 16))
+            except Exception:
+                seq_len = 16
+            if not acts:
+                print(f"[POS_ERR] {ckpt_path.name}: Skipped: no actions recorded")
+            else:
+                A = np.asarray(acts).reshape(len(acts), -1)
+                if A.shape[1] >= 6:
+                    pred_deltas = A[:, 3:6]
+                    start = max(0, seq_len - 1)
+                    end = min(start + pred_deltas.shape[0], len(env._pipette_positions))
+                    init_pos = env._pipette_positions[start]
+                    obs_pos = env._pipette_positions[start:end]
+                    n = min(pred_deltas.shape[0], obs_pos.shape[0])
+                    pred_deltas = pred_deltas[:n]
+                    obs_pos = obs_pos[:n]
+                    pred_pos = [init_pos]
+                    for d in pred_deltas:
+                        pred_pos.append(pred_pos[-1] + d)
+                    pred_pos = np.stack(pred_pos[1:])
+                    err = np.linalg.norm(pred_pos - obs_pos, axis=1)
+                    print(f"[POS_ERR] {ckpt_path.name}: steps={len(err)} | mean={err.mean():.6f} | median={np.median(err):.6f} | p95={np.percentile(err,95):.6f}")
+                else:
+                    print(f"[POS_ERR] {ckpt_path.name}: Skipped: action dimension < 6")
+
+        loss_summary = {name: total / count for name, (total, count) in loss_totals.items() if count}
         for record in per_step_records:
+            record["checkpoint"] = ckpt_path.name
+        all_per_step_records.extend(per_step_records)
+
+        summary_rows.append({
+            "checkpoint": ckpt_path.name,
+            "algo_name": algo_name,
+            "steps": steps_taken,
+            "success": success_flag,
+            "mean_reward": float(mean_reward) if mean_reward is not None else None,
+            "l2_metrics": l2_metrics,
+            "loss_summary": loss_summary,
+        })
+
+        metadata_path = getattr(args, "rollout_metadata", None)
+        if metadata_path:
+            base_meta_path = Path(metadata_path).expanduser()
+            if multi_ckpt:
+                if base_meta_path.suffix:
+                    meta_path = base_meta_path.with_name(f"{base_meta_path.stem}_{ckpt_path.stem}{base_meta_path.suffix}")
+                else:
+                    meta_path = base_meta_path / f"metadata_{ckpt_path.stem}.json"
+            else:
+                meta_path = base_meta_path
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            env_horizon = getattr(env, "_horizon", None)
+            demo_length = getattr(env, "_N", None)
+            ckpt_summary = {k: ckpt_dict[k] for k in ("epoch", "iteration", "global_step", "train_step", "model_epoch") if k in ckpt_dict}
+            train_cfg = getattr(cfg, "train", None)
+            config_seed = _safe_get(train_cfg, "seed") if train_cfg is not None else None
+            demo_key = getattr(env, "_demo_id", None)
+            if isinstance(demo_key, bytes):
+                demo_key = demo_key.decode("utf-8")
+            demo_index = None
+            if demo_key is not None:
+                try:
+                    with h5py.File(args.dataset, "r") as h5_demo:
+                        demo_keys = list(h5_demo["data"].keys())
+                    decoded_keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in demo_keys]
+                    sorted_keys = sorted(decoded_keys)
+                    if demo_key in sorted_keys:
+                        demo_index = sorted_keys.index(demo_key)
+                except Exception:
+                    demo_index = None
+            metadata = {
+                "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "agent_path": str(ckpt_path),
+                "dataset_path": str(Path(args.dataset).expanduser()),
+                "demo_id": demo_index,
+                "demo_key": demo_key,
+                "frame_stack_used": frame_stack,
+                "policy_frame_stack": policy_frame_stack,
+                "requested_frame_stack": requested_stack,
+                "env_frame_stack": getattr(env, "frame_stack", frame_stack),
+                "horizon": int(horizon) if horizon is not None else None,
+                "env_horizon": env_horizon,
+                "demo_length": demo_length,
+                "rollout_steps": steps_taken,
+                "success": success_flag,
+                "mean_reward": float(mean_reward) if mean_reward is not None else None,
+                "algo_name": algo_name,
+                "device": str(device),
+                "eps": float(args.eps) if args.eps is not None else None,
+                "per_step_csv": str(per_step_csv_target) if per_step_csv_target else None,
+                "loss_cfg": _json_safe(loss_cfg) if loss_cfg is not None else None,
+                "l2_metrics": l2_metrics,
+                "reward_stats": {
+                    "mean": float(mean_reward) if mean_reward is not None else None,
+                },
+                "checkpoint_summary": ckpt_summary or None,
+                "config_seed": config_seed,
+                "loss_summary": loss_summary or None,
+            }
+            metadata = _json_safe(metadata)
+            with meta_path.open("w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+            print(f"[RESULT] wrote rollout metadata to {meta_path}")
+
+        if hasattr(env, "close"):
+            try:
+                env.close()
+            except Exception:
+                pass
+
+    if per_step_csv_target and all_per_step_records:
+        per_step_csv_target.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = []
+        for record in all_per_step_records:
             for key in record:
                 if key not in fieldnames:
                     fieldnames.append(key)
-        with csv_path.open('w', newline='') as f:
+        if "checkpoint" in fieldnames:
+            fieldnames = ["checkpoint"] + [key for key in fieldnames if key != "checkpoint"]
+        with per_step_csv_target.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            for record in per_step_records:
-                writer.writerow({key: record.get(key, '') for key in fieldnames})
-        per_step_csv_path = csv_path
-        print(f"[RESULT] wrote per-step errors to {csv_path}")
+            for record in all_per_step_records:
+                writer.writerow({key: record.get(key, "") for key in fieldnames})
+        print(f"[RESULT] wrote per-step errors to {per_step_csv_target}")
 
-    metadata_path = getattr(args, 'rollout_metadata', None)
-    if metadata_path:
-        meta_path = Path(metadata_path).expanduser()
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        env_horizon = getattr(env, '_horizon', None)
-        demo_length = getattr(env, '_N', None)
-        ckpt_summary = {k: ckpt_dict[k] for k in ('epoch', 'iteration', 'global_step', 'train_step', 'model_epoch') if k in ckpt_dict}
-        train_cfg = getattr(cfg, 'train', None)
-        config_seed = _safe_get(train_cfg, 'seed') if train_cfg is not None else None
-        demo_key = getattr(env, '_demo_id', None)
-        if isinstance(demo_key, bytes):
-            demo_key = demo_key.decode('utf-8')
-        demo_index = None
-        if demo_key is not None:
-            try:
-                with h5py.File(args.dataset, 'r') as h5_demo:
-                    demo_keys = list(h5_demo['data'].keys())
-                decoded_keys = [k.decode('utf-8') if isinstance(k, bytes) else k for k in demo_keys]
-                sorted_keys = sorted(decoded_keys)
-                if demo_key in sorted_keys:
-                    demo_index = sorted_keys.index(demo_key)
-            except Exception:
-                demo_index = None
-        metadata = {
-            'timestamp_utc': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
-            'agent_path': str(Path(args.agent).expanduser()),
-            'dataset_path': str(Path(args.dataset).expanduser()),
-            'demo_id': demo_index,
-            'demo_key': demo_key,
-            'frame_stack_used': frame_stack,
-            'policy_frame_stack': policy_frame_stack,
-            'requested_frame_stack': requested_stack,
-            'env_frame_stack': getattr(env, 'frame_stack', frame_stack),
-            'horizon': int(args.horizon) if args.horizon is not None else None,
-            'env_horizon': env_horizon,
-            'demo_length': demo_length,
-            'rollout_steps': steps_taken,
-            'success': success_flag,
-            'mean_reward': float(mean_reward) if mean_reward is not None else None,
-            'algo_name': algo_name,
-            'device': str(device),
-            'eps': float(args.eps) if args.eps is not None else None,
-            'per_step_csv': str(per_step_csv_path) if per_step_csv_path else None,
-            'loss_cfg': _json_safe(loss_cfg) if loss_cfg is not None else None,
-            'l2_metrics': l2_metrics,
-            'reward_stats': {
-                'mean': float(mean_reward) if mean_reward is not None else None,
-            },
-            'checkpoint_summary': ckpt_summary or None,
-            'config_seed': config_seed,
-        }
-        metadata = _json_safe(metadata)
-        with meta_path.open('w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, sort_keys=True)
-        print(f"[RESULT] wrote rollout metadata to {meta_path}")
-
-    if args.show_pos_traj:
-        try:
-            seq_len = int(getattr(cfg.train, 'seq_length', 16))
-        except Exception:
-            seq_len = 16
-        A = np.asarray(acts).reshape(len(acts), -1)
-        if A.shape[1] >= 6:
-            pred_deltas = A[:, 3:6]
-            start = max(0, seq_len - 1)
-            end = min(start + pred_deltas.shape[0], len(env._pipette_positions))
-            init_pos = env._pipette_positions[start]
-            obs_pos = env._pipette_positions[start:end]
-            n = min(pred_deltas.shape[0], obs_pos.shape[0])
-            pred_deltas = pred_deltas[:n]
-            obs_pos = obs_pos[:n]
-            pred_pos = [init_pos]
-            for d in pred_deltas:
-                pred_pos.append(pred_pos[-1] + d)
-            pred_pos = np.stack(pred_pos[1:])
-            err = np.linalg.norm(pred_pos - obs_pos, axis=1)
-            print(f"[POS_ERR] steps={len(err)} | mean={err.mean():.6f} | median={np.median(err):.6f} | p95={np.percentile(err,95):.6f}")
-        else:
-            print("[POS_ERR] Skipped: action dimension < 6")
-
-
+    if summary_rows:
+        print("[SUMMARY] aggregate metrics per checkpoint:")
+        for row in summary_rows:
+            parts = [f"algo={row['algo_name'] or 'unknown'}", f"steps={row['steps']}"]
+            metrics = row.get("l2_metrics") or {}
+            if metrics:
+                if metrics.get("mean") is not None:
+                    parts.append(f"mean_l2={metrics['mean']:.6f}")
+                if metrics.get("median") is not None:
+                    parts.append(f"median_l2={metrics['median']:.6f}")
+                if metrics.get("p95") is not None:
+                    parts.append(f"p95_l2={metrics['p95']:.6f}")
+            if row.get("mean_reward") is not None:
+                parts.append(f"mean_reward={row['mean_reward']:.6f}")
+            losses = row.get("loss_summary") or {}
+            if losses:
+                loss_parts = ", ".join(f"{k}={v:.6f}" for k, v in sorted(losses.items()))
+                parts.append(f"losses[{loss_parts}]")
+            parts.append(f"success={row['success']}")
+            print(f" - {row['checkpoint']}: {' | '.join(parts)}")
 if __name__ == "__main__":
     main()
 
