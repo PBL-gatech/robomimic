@@ -23,7 +23,11 @@ import robomimic.utils.tensor_utils as TensorUtils
 # bc_path =r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_005\20250928193451"
 # bc_path =r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\NeuronHunting\v0_041\20250928212815"
 # bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_007\20250929154731"
-bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_009\20250930123649"
+# bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_009\20250930123649"
+# bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_010\20250930181724"
+# bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_100\20250930232711"
+# bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_101\20251001011946"
+bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_120\20251001180805"
 
 
 def parse_args():

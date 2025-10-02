@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import statistics
+import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, List
 from pathlib import Path
@@ -203,7 +204,7 @@ def _append_vector(prefix: str, array: Optional[Iterable], record: Dict[str, Any
         record[f'{prefix}_{idx}'] = float(value)
 
 
-def _build_step_record(step_idx: int, act_pred: np.ndarray, act_gt: np.ndarray, info: Mapping[str, Any], reward: float) -> Dict[str, Any]:
+def _build_step_record(step_idx: int, act_pred: np.ndarray, act_gt: np.ndarray, info: Mapping[str, Any], reward: float, latency_ms: Optional[float] = None) -> Dict[str, Any]:
     record: Dict[str, Any] = {
         'step': int(step_idx),
         'error_l2': float(info.get('error_l2', np.nan)),
@@ -218,6 +219,8 @@ def _build_step_record(step_idx: int, act_pred: np.ndarray, act_gt: np.ndarray, 
     _append_vector('err', err_vec, record)
     if err_vec is not None:
         _append_vector('abs_err', np.abs(err_vec), record)
+    if latency_ms is not None:
+        record['latency_ms'] = float(latency_ms)
     return record
 
 
@@ -280,14 +283,17 @@ def _summarize_losses(loss_totals: Dict[str, list]) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_009\20250930123649\models",  help="Path to .pth checkpoint")
-    ap.add_argument("--dataset", required=False,default = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_007\PatcherBot_test_dataset_v0_007_find_pipette.hdf5",  help="Path to .hdf5")
+    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_130\20251001202458\models",  help="Path to .pth checkpoint")
+    ap.add_argument("--dataset", required=False,
+                    default = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_130\PatcherBot_test_dataset_v0_130_find_pipette.hdf5",  
+                    # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\PipetteFinding\PatcherBot_dataset_v0_120_find_pipette.hdf5",
+                    help="Path to .hdf5")
     ap.add_argument("--horizon", type=int, default=None)
     ap.add_argument("--frame_stack", type=int, default=None, help="Frame stack override; defaults to policy config")
     ap.add_argument("--eps", type=float, default=-1.0)
     ap.add_argument("--show_pos_traj", action="store_true", default = True,help="compute positional trajectory error like HuntTester")
-    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_009\results_bc_PatcherBot_v0_009_5.csv", help="Optional path to save per-step action errors as CSV")
-    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_009\metadata_bc_PatcherBot_v0_009_5.json", help="Optional path to save rollout metadata as JSON")
+    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_130\results_bc_PatcherBot_v0_130_0.csv", help="Optional path to save per-step action errors as CSV")
+    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_130\metadata_bc_PatcherBot_v0_130_0.json", help="Optional path to save rollout metadata as JSON")
     args = ap.parse_args()
 
     ckpt_paths = _resolve_checkpoints(args.agent)
@@ -404,7 +410,9 @@ def main():
         for _ in range(int(horizon)):
             step_idx = env._t
             gt_action = np.asarray(env._actions_gt[min(step_idx, env._actions_gt.shape[0] - 1)], dtype=np.float32).reshape(-1)
+            start = time.perf_counter()
             act_raw = policy(ob=obs, goal=goal)
+            latency_ms = (time.perf_counter() - start) * 1000.0
             act = _extract_policy_action(act_raw)
             if act.shape[0] != gt_action.shape[0]:
                 raise ValueError(f"[run_PatcherBot_agent] action dimension mismatch: policy {act.shape[0]} vs dataset {gt_action.shape[0]} at step {step_idx}")
@@ -413,14 +421,14 @@ def main():
             errs.append(info["error_l2"])
             rewards.append(r)
             acts.append(act)
-            per_step_records.append(_build_step_record(step_idx, act, gt_action, info, r))
+            per_step_records.append(_build_step_record(step_idx, act, gt_action, info, r, latency_ms=latency_ms))
             losses = _compute_loss_components(algo_name, loss_cfg, act, gt_action)
             for name, value in losses.items():
                 total, count = loss_totals[name]
                 loss_totals[name] = [total + float(value), count + 1]
             if done:
                 break
-
+        latencies = [rec.get('latency_ms') for rec in per_step_records if rec.get('latency_ms') is not None]
         success_info = {}
         try:
             success_info = env.is_success()
@@ -430,14 +438,15 @@ def main():
 
         steps_taken = len(errs)
         mean_reward = statistics.mean(rewards) if rewards else None
-        l2_metrics = None
+        l2_metrics = latency_stats = None
+        latency_stats = (latencies and {'mean': float(statistics.mean(latencies)), 'median': float(np.median(latencies)), 'p95': float(np.percentile(latencies, 95))}) or None; latency_line = '' if not latency_stats else f" | latency_mean={latency_stats['mean']:.3f} ms | latency_median={latency_stats['median']:.3f} ms | latency_p95={latency_stats['p95']:.3f} ms"
         if errs:
             l2_metrics = {
                 "mean": float(statistics.mean(errs)),
                 "median": float(np.median(errs)),
                 "p95": float(np.percentile(errs, 95)),
             }
-            print(f"[RESULT] steps={steps_taken} | mean L2={l2_metrics['mean']:.6f} | median={l2_metrics['median']:.6f} | p95={l2_metrics['p95']:.6f}")
+            print(f"[RESULT] steps={steps_taken} | mean L2={l2_metrics['mean']:.6f} | median={l2_metrics['median']:.6f} | p95={l2_metrics['p95']:.6f}{latency_line}")
             if mean_reward is not None:
                 print(f"[RESULT] mean reward={mean_reward:.6f} | success={success_flag}")
         elif mean_reward is not None:
@@ -485,6 +494,7 @@ def main():
             "success": success_flag,
             "mean_reward": float(mean_reward) if mean_reward is not None else None,
             "l2_metrics": l2_metrics,
+            "latency_ms_stats": latency_stats,
             "loss_summary": loss_summary,
         })
 
@@ -540,6 +550,7 @@ def main():
                 "per_step_csv": str(per_step_csv_target) if per_step_csv_target else None,
                 "loss_cfg": _json_safe(loss_cfg) if loss_cfg is not None else None,
                 "l2_metrics": l2_metrics,
+                "latency_ms_stats": latency_stats,
                 "reward_stats": {
                     "mean": float(mean_reward) if mean_reward is not None else None,
                 },
