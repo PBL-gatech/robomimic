@@ -62,6 +62,8 @@ def _generate_fft_plot(
         band_cmap = plt.get_cmap("Set2", len(FFT_BAND_RATIOS))
         band_colors = [band_cmap(i) for i in range(band_cmap.N)]
 
+    mse_per_checkpoint = {ckpt: {} for ckpt in checkpoints}
+
     for dim_idx, (ax, gt_col, pred_col) in enumerate(zip(axes, gt_cols, pred_cols)):
         gt_signal = gt_rows[gt_col].to_numpy()
         if gt_signal.size < 2:
@@ -146,10 +148,27 @@ def _generate_fft_plot(
                 alpha=0.85,
             )
 
+            diff = pred_fft - gt_fft
+            mse_val = float(np.mean(np.square(diff)))
+            if np.isfinite(mse_val):
+                mse_per_checkpoint[ckpt][dim_idx] = mse_val
+
         ax.set_title(f"Dim {dim_idx}: FFT magnitude")
         ax.set_xlabel("Frequency (1/step)")
         ax.set_ylabel("Magnitude")
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+
+    if any(dim_mses for dim_mses in mse_per_checkpoint.values()):
+        print("FFT magnitude MSE (prediction vs ground truth):")
+        for ckpt in checkpoints:
+            dim_mses = mse_per_checkpoint.get(ckpt, {})
+            if not dim_mses:
+                continue
+            mean_mse = float(np.mean(list(dim_mses.values())))
+            dim_entries = ", ".join(
+                f"dim{dim_idx}: {mse:.6g}" for dim_idx, mse in sorted(dim_mses.items())
+            )
+            print(f"  {ckpt}: mean={mean_mse:.6g} ({dim_entries})")
 
     fig.suptitle(f"FFT magnitude per checkpoint ({source_name})", fontsize=14)
     fig.tight_layout(rect=[0, 0, 1.0, 0.92])
@@ -354,17 +373,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--input",
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_130\results_bc_PatcherBot_v0_130_0.csv",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\results_bc_PatcherBot_v0_142_0.csv",
         help="Path to input CSV",
     )
     parser.add_argument(
         "--out-png",
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_130\results_bc_PatcherBot_v0_130_0_preds_and_errors.png",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\results_bc_PatcherBot_v0_142_0_preds_and_errors.png",
         help="Output PNG path",
     )
     parser.add_argument(
         "--out-fft-png",
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_130\results_bc_PatcherBot_v0_130_0_fft.png",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\results_bc_PatcherBot_v0_142_0_fft.png",
         help="Optional output PNG path for FFT plot; if omitted the FFT figure is skipped.",
     )
     args = parser.parse_args()

@@ -283,17 +283,17 @@ def _summarize_losses(loss_totals: Dict[str, list]) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_130\20251001202458\models",  help="Path to .pth checkpoint")
+    ap.add_argument("--agent", required=False, default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_142\20251003225205\models",  help="Path to .pth checkpoint")
     ap.add_argument("--dataset", required=False,
-                    default = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_130\PatcherBot_test_dataset_v0_130_find_pipette.hdf5",  
+                    default = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_140\PatcherBot_test_dataset_v0_140_find_pipette.hdf5",  
                     # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\PipetteFinding\PatcherBot_dataset_v0_120_find_pipette.hdf5",
                     help="Path to .hdf5")
     ap.add_argument("--horizon", type=int, default=None)
     ap.add_argument("--frame_stack", type=int, default=None, help="Frame stack override; defaults to policy config")
     ap.add_argument("--eps", type=float, default=-1.0)
     ap.add_argument("--show_pos_traj", action="store_true", default = True,help="compute positional trajectory error like HuntTester")
-    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_130\results_bc_PatcherBot_v0_130_0.csv", help="Optional path to save per-step action errors as CSV")
-    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_130\metadata_bc_PatcherBot_v0_130_0.json", help="Optional path to save rollout metadata as JSON")
+    ap.add_argument("--per_step_csv", type=str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\results_bc_PatcherBot_v0_142_0.csv", help="Optional path to save per-step action errors as CSV")
+    ap.add_argument("--rollout_metadata",type= str, default= r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\metadata_bc_PatcherBot_v0_142_0.json", help="Optional path to save rollout metadata as JSON")
     args = ap.parse_args()
 
     ckpt_paths = _resolve_checkpoints(args.agent)
