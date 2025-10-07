@@ -34,7 +34,12 @@ def _algo_name(ckpt_dict: Mapping[str, Any]) -> str:
 
 
 def main() -> None:
-    bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_142\20251004111420"
+    # bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_142\20251004111420"
+    # bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_140\20251003184552"
+    # bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_120\20251002204916"
+    # bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_150\20251006125401"
+    # bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_160\20251006142923"
+    bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_170\20251006151641"
     parser = ExportUtils.make_export_arg_parser(default_folder=bc_path)
     args = parser.parse_args()
 
@@ -57,6 +62,11 @@ def main() -> None:
         config,
     )
 
+    obs_norm = ExportUtils.extract_obs_normalization(rollout_policy, obs_keys, goal_keys)
+    action_norm = ExportUtils.extract_action_normalization(ckpt_dict)
+    if hasattr(wrapper, 'set_normalization_stats'):
+        wrapper.set_normalization_stats(obs_norm, action_norm)
+
     dummy_inputs, input_names, output_names = ExportUtils.create_dummy_inputs(
         obs_shapes,
         goal_shapes,
@@ -65,9 +75,6 @@ def main() -> None:
     )
 
     ExportUtils.export_to_onnx(wrapper, dummy_inputs, input_names, output_names, onnx_path)
-
-    obs_norm = ExportUtils.extract_obs_normalization(rollout_policy, obs_keys, goal_keys)
-    action_norm = ExportUtils.extract_action_normalization(ckpt_dict)
 
     obs_stats_path = None
     if obs_norm:
@@ -91,8 +98,10 @@ def main() -> None:
         is_recurrent=is_recurrent,
         obs_stats_filename=obs_stats_path.name if obs_stats_path else None,
         action_stats_filename=action_stats_path.name if action_stats_path else None,
-        needs_postprocessing=bool(action_norm),
+        needs_postprocessing=False,
         export_directory=export_dir,
+        requires_preprocessing=False,
+        requires_postprocessing=False,
     )
     ExportUtils.write_metadata(metadata, manifest_path)
 

@@ -373,17 +373,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--input",
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\results_bc_PatcherBot_v0_142_0.csv",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_150\results_bc_PatcherBot_v0_150_0.csv",
         help="Path to input CSV",
     )
     parser.add_argument(
         "--out-png",
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\results_bc_PatcherBot_v0_142_0_preds_and_errors.png",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_150\results_bc_PatcherBot_v0_150_0_preds_and_errors.png",
         help="Output PNG path",
     )
     parser.add_argument(
         "--out-fft-png",
-        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_142\results_bc_PatcherBot_v0_142_0_fft.png",
+        default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_150\results_bc_PatcherBot_v0_150_0_fft.png",
         help="Optional output PNG path for FFT plot; if omitted the FFT figure is skipped.",
     )
     args = parser.parse_args()

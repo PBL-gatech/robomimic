@@ -266,6 +266,26 @@ def build_actor_export_module(
             self.obs_shapes = obs_shapes
             self.goal_shapes = goal_shapes
             self.output_names = ["actions"] + (["h1", "c1"] if self.is_recurrent else [])
+            self.obs_norm_stats = None
+            self.action_norm_stats = None
+
+        def set_normalization_stats(self, obs_stats=None, action_stats=None):
+            device = torch.device("cpu")
+            if obs_stats:
+                stats = TensorUtils.to_tensor(obs_stats)
+                stats = TensorUtils.to_float(stats)
+                stats = TensorUtils.to_device(stats, device)
+                self.obs_norm_stats = stats
+            else:
+                self.obs_norm_stats = None
+            if action_stats:
+                stats = TensorUtils.to_tensor(action_stats)
+                stats = TensorUtils.to_float(stats)
+                stats = TensorUtils.to_device(stats, device)
+                self.action_norm_stats = stats
+            else:
+                self.action_norm_stats = None
+            return self
 
         def _build_dict(self, keys: Sequence[str], tensors: Sequence[torch.Tensor]) -> OrderedDict:
             data = OrderedDict()
@@ -277,6 +297,11 @@ def build_actor_export_module(
             if not tensors:
                 return tensors
             processed = ObsUtils.process_obs_dict(tensors)
+            if self.obs_norm_stats:
+                present = [k for k in tensors.keys() if k in self.obs_norm_stats]
+                if present:
+                    stats = {k: self.obs_norm_stats[k] for k in present}
+                    processed = ObsUtils.normalize_dict(processed, normalization_stats=stats)
             return OrderedDict((k, processed[k]) for k in tensors.keys())
 
         def _process_goal(self, tensors: OrderedDict) -> OrderedDict:
@@ -294,6 +319,31 @@ def build_actor_export_module(
                     tensor = tensor.squeeze(1)
                 sanitized[key] = tensor
             return sanitized
+
+        def _postprocess_actions(self, actions):
+            if self.action_norm_stats is None:
+                return actions
+            if isinstance(actions, torch.Tensor):
+                stats = self.action_norm_stats.get("actions")
+                if stats is None:
+                    return actions
+                offset = stats["offset"].to(actions.device)
+                scale = stats["scale"].to(actions.device)
+                result = actions * scale + offset
+                return result
+            if isinstance(actions, dict):
+                stats = {k: self.action_norm_stats[k] for k in actions if k in self.action_norm_stats}
+                if not stats:
+                    return actions
+                stats = TensorUtils.to_device(stats, next(iter(actions.values())).device)
+                return ObsUtils.unnormalize_dict(actions, normalization_stats=stats)
+            if isinstance(actions, (list, tuple)) and actions:
+                first = self._postprocess_actions(actions[0])
+                remainder = actions[1:]
+                if isinstance(actions, list):
+                    return [first, *remainder]
+                return (first, *remainder)
+            return actions
 
         def forward(self, *inputs: torch.Tensor):
             idx = 0
@@ -320,10 +370,21 @@ def build_actor_export_module(
                     rnn_init_state=(h0, c0),
                     return_state=True,
                 )
+                actions = self._postprocess_actions(actions)
                 return actions, h1, c1
 
-            return self.actor_net(obs_dict, goal_dict=goal_dict)
-
+            output = self.actor_net(obs_dict, goal_dict=goal_dict)
+            if isinstance(output, torch.Tensor):
+                return self._postprocess_actions(output)
+            if isinstance(output, dict):
+                return self._postprocess_actions(output)
+            if isinstance(output, (list, tuple)) and output:
+                processed = self._postprocess_actions(output[0])
+                rest = output[1:]
+                if isinstance(output, list):
+                    return [processed, *rest]
+                return (processed, *rest)
+            return output
     wrapper = OnnxPolicy().cpu().eval()
     return wrapper, obs_keys, goal_keys, is_recurrent, obs_shapes, goal_shapes, rnn_cfg
 
@@ -415,9 +476,13 @@ def make_metadata(
     action_stats_filename: Optional[str],
     needs_postprocessing: bool,
     export_directory: pathlib.Path,
+    requires_preprocessing: bool = False,
+    requires_postprocessing: Optional[bool] = None,
 ) -> Dict[str, Any]:
     export_dir = pathlib.Path(export_directory).expanduser()
     onnx_path = pathlib.Path(onnx_path).expanduser()
+    if requires_postprocessing is None:
+        requires_postprocessing = bool(needs_postprocessing)
     return {
         "model_name": pathlib.Path(ckpt_path).stem,
         "checkpoint_file": pathlib.Path(ckpt_path).name,
@@ -429,8 +494,8 @@ def make_metadata(
         "observation_keys": list(obs_keys),
         "goal_keys": list(goal_keys),
         "is_recurrent": bool(is_recurrent),
-        "requires_preprocessing": True,
-        "requires_postprocessing": bool(needs_postprocessing),
+        "requires_preprocessing": bool(requires_preprocessing),
+        "requires_postprocessing": bool(requires_postprocessing),
         "normalization_files": {
             "observation": obs_stats_filename,
             "action": action_stats_filename,
