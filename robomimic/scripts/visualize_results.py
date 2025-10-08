@@ -372,13 +372,13 @@ def main(args):
 
 if __name__ == "__main__":
 
-    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_160\results_bc_PatcherBot_v0_160_0.csv"
-    bc_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_160\results_bc_PatcherBot_v0_160_0_preds_and_errors.png"
-    bc_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_160\results_bc_PatcherBot_v0_160_0_fft.png"
+    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\results_bc_PatcherBot_v0_180_0.csv"
+    bc_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\results_bc_PatcherBot_v0_180_0_preds_and_errors.png"
+    bc_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\results_bc_PatcherBot_v0_180_0_fft.png"
 
-    df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_160\results_df_PatcherBot_v0_160_0.csv"
-    df_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_160\results_df_PatcherBot_v0_160_0_preds_and_errors.png"
-    df_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_160\results_df_PatcherBot_v0_160_0_fft.png"
+    df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\results_df_PatcherBot_v0_180_0.csv"
+    df_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\results_df_PatcherBot_v0_180_0_preds_and_errors.png"
+    df_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\results_df_PatcherBot_v0_180_0_fft.png"
 
     parser = argparse.ArgumentParser()
     parser.add_argument(

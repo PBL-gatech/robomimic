@@ -279,18 +279,18 @@ def _summarize_losses(loss_totals: Dict[str, list]) -> str:
 def main():
 
     #behaviorial cloning with LSTM paths
-    bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_160\20251007135738"
-    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_160\results_bc_PatcherBot_v0_160_0.csv"
-    bc_json_path =  r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_160\metadata_bc_PatcherBot_v0_160_0.json"
+    bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_180\20251007135738"
+    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\results_bc_PatcherBot_v0_180_0.csv"
+    bc_json_path =  r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\metadata_bc_PatcherBot_v0_180_0.json"
 
     # diffusion policy paths
-    df_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_160\20251007110009"
-    df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_160\results_df_PatcherBot_v0_160_0.csv"
-    df_json_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_160\metadata_df_PatcherBot_v0_160_0.json"
+    df_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_180\20251007143506"
+    df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\results_df_PatcherBot_v0_180_0.csv"
+    df_json_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\metadata_df_PatcherBot_v0_180_0.json"
 
     #datapaths
-    data_path = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_160\PatcherBot_test_dataset_v0_160_find_pipette.hdf5" # test data
-    training_data_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\PipetteFinding\PatcherBot_dataset_v0_160_find_pipette.hdf5" # training data
+    data_path = r"C:\Users\sa-forest\Documents\GitHub\holypipette-pbl\experiments\Datasets\PatcherBot_test_dataset_v0_180\PatcherBot_test_dataset_v0_180_find_pipette.hdf5" # test data
+    training_data_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\PipetteFinding\PatcherBot_dataset_v0_180_find_pipette.hdf5" # training data
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", required=False, default = df_path,  help="Path to .pth checkpoint")
