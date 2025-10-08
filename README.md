@@ -15,6 +15,8 @@
 
 -------
 ## Latest Updates
+- [06/20/2025] **v0.5.0**: Diffusion Policy, multi-dataset training, language-conditioned policies, and more! 
+- [03/11/2025] **v0.4.0**: support for [robosuite v1.5](https://github.com/ARISE-Initiative/robosuite/tree/v1.5.1) and migrate robomimic datasets to HuggingFace
 - [10/11/2023] **v0.3.1**: support for extracting, training on, and visualizing depth observations for robosuite datasets
 - [07/03/2023] **v0.3.0**: BC-Transformer and IQL :brain:, support for DeepMind MuJoCo bindings :robot:, pre-trained image reps :eye:, wandb logging :chart_with_upwards_trend:, and more
 - [05/23/2022] **v0.2.1**: Updated website and documentation to feature more tutorials :notebook_with_decorative_cover:
@@ -64,6 +66,19 @@ It offers a broad set of demonstration datasets collected on robot manipulation 
 ## Reproducing benchmarks
 
 The robomimic framework also makes reproducing the results from different benchmarks and datasets easy. See the [datasets page](https://robomimic.github.io/docs/datasets/overview.html) for more information on downloading datasets and reproducing experiments.
+
+## Docker
+
+You can use the `Dockerfile` to easily build a containerized environment for setting up robomimic with Python 3.9, Miniconda, robosuite, and PyTorch (CPU/GPU support).
+
+To build, run:
+`docker build -t robomimic .`
+
+To run without GPU (CPU only), run:
+`docker run -it robomimic`
+
+To run with GPU (if available), run:
+`docker run --gpus all -it robomimic`
 
 ## Troubleshooting
 

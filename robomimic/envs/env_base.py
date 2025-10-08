@@ -14,6 +14,7 @@ class EnvType:
     ROBOSUITE_TYPE = 1
     GYM_TYPE = 2
     IG_MOMART_TYPE = 3
+    PATCHER_TYPE = 4
 
 
 class EnvBase(abc.ABC):
@@ -26,7 +27,6 @@ class EnvBase(abc.ABC):
         render_offscreen=False, 
         use_image_obs=False, 
         use_depth_obs=False, 
-        postprocess_visual_obs=True, 
         **kwargs,
     ):
         """
@@ -46,10 +46,6 @@ class EnvBase(abc.ABC):
             use_depth_obs (bool): if True, environment is expected to render depth image observations
                 on every env.step call. Set this to False for efficiency reasons, if depth
                 observations are not required.
-
-            postprocess_visual_obs (bool): if True, postprocess image observations
-                to prepare for learning. This should only be False when extracting observations
-                for saving to a dataset (to save space on RGB images for example).
         """
         return
 

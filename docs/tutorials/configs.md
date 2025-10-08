@@ -19,7 +19,7 @@ Please see the [Config documentation](../modules/configs.html) for more informat
 The preferred way to specify training parameters is to pass a config json to the main training script `train.py` via the `--config` argument. The dataset can be specified by setting the `data` attribute of the `train` section of the config json, or specified via the `--dataset` argument. The example below runs a default template json for the BC algorithm. **This is the preferred way to launch training runs.**
 
 ```sh
-$ python train.py --config ../exps/templates/bc.json --dataset ../../tests/assets/test_v141.hdf5
+$ python train.py --config ../exps/templates/bc.json --dataset ../../tests/assets/test_v15.hdf5
 ```
 
 Please see the [hyperparameter helper tutorial](../tutorials/hyperparam_scan.html) to see how to easily generate json configs for launching training runs.
@@ -39,7 +39,7 @@ config = config_factory(algo_name="bc")
 
 # set config attributes here that you would like to update
 config.experiment.name = "bc_rnn_example"
-config.train.data = "/path/to/dataset.hdf5"
+config.train.data = [{"path": "/path/to/dataset.hdf5"}]
 config.train.output_dir = "/path/to/desired/output_dir"
 config.train.batch_size = 256
 config.train.num_epochs = 500
