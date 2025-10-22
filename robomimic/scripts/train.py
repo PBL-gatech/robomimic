@@ -393,7 +393,7 @@ def train(config, device, resume=False):
         )
 
         # keep a backup model in case last.pth is malformed (e.g. job died last time during saving)
-        shutil.copyfile(latest_model_path, latest_model_backup_path)
+        TrainUtils.safe_copy_file(latest_model_path, latest_model_backup_path)
         print("\nsaved backup of latest model at {}\n".format(latest_model_backup_path))
 
         # Finally, log memory usage in MB
@@ -454,7 +454,7 @@ def main(args):
     # catch error during training and print it
     res_str = "finished run successfully!"
     try:
-        train(config, device=device, resume=args.resume)
+        train(config, device=device, resume=True)
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
     print(res_str)
@@ -469,8 +469,8 @@ if __name__ == "__main__":
         type=str,
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\NeuronHunting\bc\bc-PatcherBot_v0_041.json", # neuron hunting with lstm
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\df-PatcherBot_v0_003.json", # neuron hunting with diffusion
-        # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\bc\bc-PatcherBot_v0_180.json", # pipette finding with lstm
-        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_180.json", # pipette finding with diffusion
+        # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\bc\bc-PatcherBot_v0_511.json", # pipette finding with lstm
+        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_511.json", # pipette finding with diffusion
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
     )

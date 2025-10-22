@@ -372,28 +372,28 @@ def main(args):
 
 if __name__ == "__main__":
 
-    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\results_bc_PatcherBot_v0_180_0.csv"
-    bc_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\results_bc_PatcherBot_v0_180_0_preds_and_errors.png"
-    bc_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_180\results_bc_PatcherBot_v0_180_0_fft.png"
+    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_511\results_bc_PatcherBot_v0_511_0.csv"
+    bc_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_511\results_bc_PatcherBot_v0_511_0_preds_and_errors.png"
+    bc_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_511\results_bc_PatcherBot_v0_511_0_fft.png"
 
-    df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\results_df_PatcherBot_v0_180_0.csv"
-    df_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\results_df_PatcherBot_v0_180_0_preds_and_errors.png"
-    df_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_180\results_df_PatcherBot_v0_180_0_fft.png"
+    df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_511\results_df_PatcherBot_v0_511_0.csv"
+    df_err_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_511\results_df_PatcherBot_v0_511_0_preds_and_errors.png"
+    df_fft_png = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_511\results_df_PatcherBot_v0_511_0_fft.png"
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--input",
-        default= df_csv_path,
+        default= bc_csv_path,
         help="Path to input CSV",
     )
     parser.add_argument(
         "--out-png",
-        default=df_err_png,
+        default=bc_err_png,
         help="Output PNG path",
     )
     parser.add_argument(
         "--out-fft-png",
-        default=df_fft_png,
+        default=bc_fft_png,
         help="Optional output PNG path for FFT plot; if omitted the FFT figure is skipped.",
     )
     args = parser.parse_args()

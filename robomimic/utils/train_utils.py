@@ -5,6 +5,7 @@ which is the core training logic for models in this repository.
 """
 import os
 import time
+import errno
 import datetime
 import shutil
 import json
@@ -585,6 +586,72 @@ def should_save_from_rollout_logs(
     )
 
 
+def _safe_torch_save(params, ckpt_path, wait_seconds=10, max_retries=3):
+    """
+    Attempt to write checkpoint parameters to disk, retrying if the destination file
+    is temporarily locked by another process. Retries only occur for permission and
+    file-access related errors.
+    """
+    last_err = None
+    total_attempts = max_retries + 1
+    for attempt in range(total_attempts):
+        try:
+            torch.save(params, ckpt_path)
+            return
+        except (RuntimeError, OSError) as err:
+            message = str(err).lower()
+            access_error = isinstance(err, OSError) and err.errno in (errno.EACCES, errno.EPERM)
+            access_error = access_error or ("cannot be opened" in message) or ("permission" in message)
+            if not access_error or attempt == max_retries:
+                raise
+            print(
+                "Warning: unable to save checkpoint to {} (attempt {}/{}). "
+                "Retrying in {}s. Error: {}".format(
+                    ckpt_path,
+                    attempt + 1,
+                    total_attempts,
+                    wait_seconds,
+                    err,
+                )
+            )
+            time.sleep(wait_seconds)
+            last_err = err
+    raise last_err
+
+
+def safe_copy_file(src_path, dst_path, wait_seconds=10, max_retries=3):
+    """
+    Copy a file with retries to handle temporary sharing violations (common on Windows).
+    Only retries for access-related errors.
+    """
+    last_err = None
+    total_attempts = max_retries + 1
+    for attempt in range(total_attempts):
+        try:
+            shutil.copyfile(src_path, dst_path)
+            return
+        except (OSError, shutil.SameFileError) as err:
+            message = str(err).lower()
+            access_error = isinstance(err, OSError) and err.errno in (errno.EACCES, errno.EPERM)
+            access_error = access_error or ("permission" in message) or ("access" in message)
+            if not access_error or attempt == max_retries:
+                raise
+            print(
+                "Warning: unable to copy checkpoint from {} to {} (attempt {}/{}). "
+                "Retrying in {}s. Error: {}".format(
+                    src_path,
+                    dst_path,
+                    attempt + 1,
+                    total_attempts,
+                    wait_seconds,
+                    err,
+                )
+            )
+            time.sleep(wait_seconds)
+            last_err = err
+    raise last_err
+
+
 def save_model(model, config, env_meta, shape_meta, ckpt_path, variable_state=None, obs_normalization_stats=None, action_normalization_stats=None):
     """
     Save model to a torch pth file.
@@ -630,7 +697,7 @@ def save_model(model, config, env_meta, shape_meta, ckpt_path, variable_state=No
     if action_normalization_stats is not None:
         action_normalization_stats = deepcopy(action_normalization_stats)
         params["action_normalization_stats"] = TensorUtils.to_list(action_normalization_stats)
-    torch.save(params, ckpt_path)
+    _safe_torch_save(params=params, ckpt_path=ckpt_path)
     print("save checkpoint to {}".format(ckpt_path))
 
 
