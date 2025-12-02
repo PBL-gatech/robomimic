@@ -139,7 +139,7 @@ def train(config, device, resume=False):
                     env_name=env_name,
                     render=False,
                     render_offscreen=config.experiment.render_video,
-                    use_image_obs=shape_meta["use_images"],
+                    use_image_obs=shape_meta["use_images"] or shape_meta["use_depths"],
                 )
                 env = EnvUtils.create_env_from_metadata(**env_kwargs)
                 # handle environment wrappers
@@ -332,7 +332,14 @@ def train(config, device, resume=False):
         # Evaluate the model on validation set
         if config.experiment.validate:
             with torch.no_grad():
-                step_log = TrainUtils.run_epoch(model=model, data_loader=valid_loader, epoch=epoch, validate=True, num_steps=valid_num_steps)
+                step_log = TrainUtils.run_epoch(
+                    model=model,
+                    data_loader=valid_loader,
+                    epoch=epoch,
+                    validate=True,
+                    num_steps=valid_num_steps,
+                    obs_normalization_stats=obs_normalization_stats,
+                )
             for k, v in step_log.items():
                 if k.startswith("Time_"):
                     data_logger.record("Timing_Stats/Valid_{}".format(k[5:]), v, epoch)
