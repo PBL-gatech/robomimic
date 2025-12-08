@@ -137,3 +137,12 @@ macros_private.py
 /data
 /bc_patcherBot_trained_models_restart
 /PACEscripts
+/bc_patcherBot
+/df_patcherBot
+/robomimic/exps/templates/NeuronHunting
+/robomimic/exps/templates/PipetteFinding
+/robomimic/scripts/debug
+/temp
+/training
+/training
+/training
