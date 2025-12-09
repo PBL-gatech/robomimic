@@ -48,7 +48,6 @@ def algo_config_to_class(algo_config):
     else:
         raise RuntimeError()
 
-
 class DiffusionPolicyUNet(PolicyAlgo):
     def _create_networks(self):
         """
@@ -111,7 +110,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         ema = None
         if self.algo_config.ema.enabled:
             ema = EMAModel(model=nets, power=self.algo_config.ema.power)
-                
+
         # set attrs
         self.nets = nets
         self.noise_scheduler = noise_scheduler
