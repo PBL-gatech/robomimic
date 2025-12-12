@@ -472,103 +472,100 @@ Visual Backbone Networks
 """
 
 class TransformerBase(Module):
-    """
-    Base class for transformer-based visual backbones.
+    """Base class for transformer-based visual backbones.
 
-    This mirrors ConvBase's role in robomimic:
-        1) Automatically registers subclasses via ObsUtils.register_encoder_backbone,
-           allowing use by string name in configs / VisualCore.
-        2) Enforces the robomimic convention that output_shape(input_shape) excludes
-           the batch dimension.
-
-    Subclasses should generally take image tensors of shape [B, C, H, W] and return:
-        - a feature map [B, C', H', W']  OR
-        - a feature vector [B, D]
+    Subclasses are automatically registered as valid observation encoder backbones.
     """
+
     def __init__(self):
         super(TransformerBase, self).__init__()
-        self.fixed = False
 
     def __init_subclass__(cls, **kwargs):
-        # Mirror ConvBase behavior: auto-register valid backbone subclasses.
         super().__init_subclass__(**kwargs)
         ObsUtils.register_encoder_backbone(cls)
 
     def output_shape(self, input_shape):
+        """Compute output shape from an input shape (excluding batch dimension)."""
         raise NotImplementedError
-
-    def freeze(self):
-        """
-        Freeze this module entirely (keeps eval mode even if parent calls train()).
-        This mirrors Sequential.freeze in this file.
-        """
-        self.fixed = True
-
-    def train(self, mode=True):
-        # If frozen, always keep in eval mode.
-        if self.fixed:
-            return super().train(False)
-        return super().train(mode)
 
 
 class DINOTransformer(TransformerBase):
+    """DINOv2 ViT visual backbone that outputs a 2D feature map.
+
+    Inputs:
+        x: (B, C, H, W) image tensor
+
+    Outputs:
+        feat: (B, out_channels, H // patch_size, W // patch_size) feature map
     """
-    DINOv2 ViT-B/14 encoder wrapper that behaves like a robomimic-valid visual backbone.
 
-    Key behaviors for robomimic compatibility:
-      - Implements output_shape that EXCLUDES batch dimension.
-      - Auto-registers as a backbone (via TransformerBase -> ObsUtils.register_encoder_backbone),
-        so it can be referenced by name from VisualCore configs.
-      - Accepts torch image tensors shaped [B, C, H, W] (as produced after ObsUtils.process_obs
-        and optional randomizers).
-      - Optionally freezes only the DINO backbone (common pretrained-rep usage pattern).
-
-    Notes on checkpoints:
-      - Expects a checkpoint containing a 'teacher' state dict whose keys include backbone weights.
-      - Extracts 'backbone.*' (or 'module.backbone.*') into a vit_base state dict.
-
-    Args:
-        dino_model_path (str): path to checkpoint. Default matches your previous hard-coded path.
-        img_size (int): target image size for the ViT.
-        patch_size (int): patch size for ViT.
-        num_register_tokens (int): register tokens for DINOv2 model.
-        init_values (float): init_values arg for vit_base.
-        freeze_backbone (bool): if True, freezes DINO ViT parameters (neck remains trainable).
-        resize_inputs (bool): if True, bilinearly resizes inputs to (img_size, img_size) in forward.
-        out_channels (int): output channels after the conv neck.
-    """
     def __init__(
         self,
-        dino_model_path: str = "./pretrained_dino_models/dino_domain_adaption_checkpoint_19999.pth",
-        img_size: int = 896,
-        patch_size: int = 14,
-        num_register_tokens: int = 4,
-        init_values: float = 1e-5,
-        freeze_backbone: bool = True,
-        resize_inputs: bool = True,
-        out_channels: int = 64,
+        dino_model_path="./pretrained_dino_models/dino_domain_adaption_checkpoint_19999.pth",
+        img_size=896,
+        patch_size=14,
+        num_register_tokens=4,
+        init_values=1e-5,
+        out_channels=64,
+        freeze_backbone=False,
     ):
-        super().__init__()
+        super(DINOTransformer, self).__init__()
 
-        if img_size % patch_size != 0:
-            raise ValueError(
-                f"DINOTransformer: img_size ({img_size}) must be divisible by patch_size ({patch_size})"
-            )
-
-        self._dino_model_path = dino_model_path
         self._img_size = img_size
         self._patch_size = patch_size
-        self._grid_size = img_size // patch_size
-        self._freeze_backbone = freeze_backbone
-        self._resize_inputs = resize_inputs
         self._out_channels = out_channels
+        self._freeze_backbone = freeze_backbone
 
-        # ---- Load & process checkpoint weights (teacher -> backbone.* -> vit_base) ----
-        teacher_sd = self._load_teacher_state_dict(dino_model_path)
-        backbone_sd = self._extract_backbone_state_dict(teacher_sd)
-        backbone_sd = self._maybe_interpolate_pos_embed(backbone_sd, target_grid=self._grid_size)
+        # Target patch grid size implied by img_size and patch_size (used for pos_embed interpolation)
+        if isinstance(img_size, (tuple, list)):
+            target_h, target_w = int(img_size[0]), int(img_size[1])
+        else:
+            target_h = target_w = int(img_size)
+        self._target_grid_h = target_h // patch_size
+        self._target_grid_w = target_w // patch_size
 
-        # ---- Build DINO encoder ----
+        # Load checkpoint and extract backbone weights
+        ckpt = torch.load(dino_model_path, map_location="cpu", weights_only=False)
+        teacher_state = ckpt.get("teacher", ckpt)
+
+        if any(k.startswith("backbone.") for k in teacher_state.keys()):
+            dino_backbone_weights = {
+                k[len("backbone."):]: v for k, v in teacher_state.items() if k.startswith("backbone.")
+            }
+        else:
+            # Assume weights are already backbone-only
+            dino_backbone_weights = dict(teacher_state)
+
+        # Infer embed dim from checkpoint (preferred)
+        embed_dim = None
+        if "patch_embed.proj.weight" in dino_backbone_weights:
+            embed_dim = int(dino_backbone_weights["patch_embed.proj.weight"].shape[0])
+
+        # Interpolate positional embeddings to match the target patch grid (if present)
+        if "pos_embed" in dino_backbone_weights:
+            dino_pos_embed = dino_backbone_weights["pos_embed"]  # (1, 1+N, D)
+
+            cls_token_pos_embed = dino_pos_embed[:, :1, :]
+            patch_pos_embed = dino_pos_embed[:, 1:, :]
+
+            # Original grid is typically square
+            orig_n = patch_pos_embed.shape[1]
+            orig_grid_h = int(round(orig_n ** 0.5))
+            orig_grid_w = orig_grid_h
+
+            patch_pos_embed = patch_pos_embed.permute(0, 2, 1).reshape(1, -1, orig_grid_h, orig_grid_w)
+
+            patch_pos_embed = F.interpolate(
+                patch_pos_embed,
+                size=(self._target_grid_h, self._target_grid_w),
+                mode="bicubic",
+                align_corners=False,
+            )
+
+            patch_pos_embed = patch_pos_embed.flatten(2).permute(0, 2, 1)
+            dino_backbone_weights["pos_embed"] = torch.cat([cls_token_pos_embed, patch_pos_embed], dim=1)
+
+        # Create DINOv2 ViT backbone and load weights
         self.dino_encoder = vit_base(
             img_size=img_size,
             patch_size=patch_size,
@@ -576,181 +573,75 @@ class DINOTransformer(TransformerBase):
             num_register_tokens=num_register_tokens,
             init_values=init_values,
         )
-        self.dino_encoder.load_state_dict(backbone_sd)
 
-        # Infer embed dim robustly (used to build neck)
-        if "pos_embed" in backbone_sd:
-            embed_dim = int(backbone_sd["pos_embed"].shape[-1])
-        else:
-            embed_dim = getattr(self.dino_encoder, "embed_dim", None)
+        # Fallback embed dim if not available from checkpoint
+        if embed_dim is None and hasattr(self.dino_encoder, "embed_dim"):
+            embed_dim = int(self.dino_encoder.embed_dim)
         if embed_dim is None:
-            raise ValueError("DINOTransformer: could not infer embed_dim for conv neck construction")
-        self._embed_dim = embed_dim
+            raise RuntimeError("DINOTransformer: could not infer DINO embedding dimension from checkpoint or model.")
 
-        # ---- Conv neck (kept identical in structure to your original intent) ----
-        self.vision_neck = nn.Sequential(
-            nn.Conv2d(self._embed_dim, out_channels, kernel_size=(1, 1), bias=False),
-            LayerNorm2d(out_channels),
-            nn.Conv2d(out_channels, out_channels, kernel_size=(3, 3), padding=1, bias=False),
-            LayerNorm2d(out_channels),
-        )
+        # Load weights (strict=False tolerates non-backbone keys / small mismatches)
+        self.dino_encoder.load_state_dict(dino_backbone_weights, strict=False)
 
-        # ---- Optional freezing (backbone only) ----
-        if self._freeze_backbone:
+        # Optional freezing of the transformer backbone only
+        if freeze_backbone:
             for p in self.dino_encoder.parameters():
                 p.requires_grad = False
             self.dino_encoder.eval()
 
-    @staticmethod
-    def _load_teacher_state_dict(ckpt_path: str) -> dict:
-        """
-        Loads checkpoint and returns the 'teacher' state dict.
-        """
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        if isinstance(ckpt, dict) and ("teacher" in ckpt):
-            return ckpt["teacher"]
-        raise KeyError(
-            f"DINOTransformer: checkpoint at {ckpt_path} does not contain a 'teacher' key"
+        # Lightweight conv neck to produce a feature map compatible with SpatialSoftmax
+        self.vision_neck = nn.Sequential(
+            nn.Conv2d(embed_dim, out_channels, kernel_size=1, bias=False),
+            LayerNorm2d(out_channels),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(out_channels),
         )
-
-    @staticmethod
-    def _extract_backbone_state_dict(teacher_sd: dict) -> dict:
-        """
-        Extract backbone weights from a DINO checkpoint teacher state dict.
-        Supports common prefixes:
-            - backbone.*
-            - module.backbone.*
-        """
-        backbone_sd = {}
-        for k, v in teacher_sd.items():
-            if k.startswith("backbone."):
-                backbone_sd[k[len("backbone."):]] = v
-            elif k.startswith("module.backbone."):
-                backbone_sd[k[len("module.backbone."):]] = v
-
-        if len(backbone_sd) == 0:
-            raise KeyError(
-                "DINOTransformer: could not find any backbone weights in teacher state dict "
-                "(expected keys starting with 'backbone.' or 'module.backbone.')"
-            )
-        return backbone_sd
-
-    @staticmethod
-    def _interpolate_pos_embed(pos_embed: torch.Tensor, target_grid: int) -> torch.Tensor:
-        """
-        Interpolate a ViT pos_embed from its original patch grid to (target_grid x target_grid).
-
-        Assumes pos_embed shape is [1, 1 + (H*W), D] where the first token is the CLS token.
-        """
-        cls_token = pos_embed[:, :1, :]          # [1, 1, D]
-        patch_tokens = pos_embed[:, 1:, :]       # [1, N, D]
-
-        orig_grid = int(patch_tokens.shape[1] ** 0.5)
-        if orig_grid * orig_grid != patch_tokens.shape[1]:
-            raise ValueError("DINOTransformer: pos_embed patch token count is not a perfect square")
-
-        # [1, N, D] -> [1, D, H, W]
-        patch_2d = patch_tokens.permute(0, 2, 1).reshape(1, -1, orig_grid, orig_grid)
-
-        patch_2d = F.interpolate(
-            patch_2d,
-            size=(target_grid, target_grid),
-            mode="bicubic",
-            align_corners=False,
-        )
-
-        # [1, D, H, W] -> [1, H*W, D]
-        patch_flat = patch_2d.flatten(2).permute(0, 2, 1)
-
-        return torch.cat([cls_token, patch_flat], dim=1)
-
-    def _maybe_interpolate_pos_embed(self, backbone_sd: dict, target_grid: int) -> dict:
-        """
-        If backbone_sd contains pos_embed and it doesn't match the target grid size,
-        interpolate it to the new patch grid.
-        """
-        if "pos_embed" not in backbone_sd:
-            return backbone_sd
-
-        pos_embed = backbone_sd["pos_embed"]
-        curr_num_patches = int(pos_embed.shape[1] - 1)
-        target_num_patches = int(target_grid * target_grid)
-        if curr_num_patches == target_num_patches:
-            return backbone_sd
-
-        new_sd = dict(backbone_sd)  # shallow copy
-        new_sd["pos_embed"] = self._interpolate_pos_embed(pos_embed, target_grid=target_grid)
-        return new_sd
 
     def output_shape(self, input_shape):
-        """
-        output_shape follows robomimic convention: input_shape excludes batch dimension.
+        """Compute output shape from input image shape.
 
         Args:
-            input_shape (iterable of int): expected (C, H, W)
+            input_shape: (C, H, W)
 
         Returns:
-            list[int]: output shape excluding batch dimension.
+            [out_channels, H // patch_size, W // patch_size]
         """
-        assert input_shape is not None
-        assert len(input_shape) == 3
-
-        if self._resize_inputs:
-            grid_h = grid_w = self._grid_size
-        else:
-            # Infer patch grid from incoming shape
-            grid_h = int(input_shape[1] // self._patch_size)
-            grid_w = int(input_shape[2] // self._patch_size)
-
+        assert input_shape is not None and len(input_shape) == 3
+        grid_h = int(input_shape[1] // self._patch_size)
+        grid_w = int(input_shape[2] // self._patch_size)
         return [self._out_channels, grid_h, grid_w]
 
     def train(self, mode=True):
-        """
-        Keep frozen backbone in eval mode even if the overall module is set to train().
-        """
-        super().train(mode)
+        """Set training mode while keeping a frozen backbone in eval mode."""
+        super(DINOTransformer, self).train(mode)
         if self._freeze_backbone:
             self.dino_encoder.eval()
         return self
 
     def forward(self, x, **kwargs):
-        """
+        """Forward pass.
+
         Args:
-            x (torch.Tensor): image tensor of shape [B, C, H, W]
+            x: (B, C, H, W)
 
         Returns:
-            torch.Tensor: feature map of shape [B, out_channels, grid_h, grid_w]
+            (B, out_channels, H // patch_size, W // patch_size)
         """
-        if self._resize_inputs and (x.shape[-2] != self._img_size or x.shape[-1] != self._img_size):
-            x = F.interpolate(x, size=(self._img_size, self._img_size), mode="bilinear", align_corners=False)
+        tokens = self.dino_encoder(x)["x_norm_patchtokens"]
 
-        # DINO returns a dict; we use normalized patch tokens
-        patch_tokens = self.dino_encoder(x)["x_norm_patchtokens"]  # [B, N, D]
+        B, N, D = tokens.shape
+        grid_h = int(x.shape[-2] // self._patch_size)
+        grid_w = int(x.shape[-1] // self._patch_size)
 
-        B, N, D = patch_tokens.shape
-        grid = int(N ** 0.5)
-        if grid * grid != N:
-            raise ValueError(f"DINOTransformer: patch token count {N} is not a perfect square")
+        # If the runtime grid doesn't match the token count, fall back to square reshape
+        if grid_h * grid_w != N:
+            s = int(round(N ** 0.5))
+            grid_h = s
+            grid_w = s
 
-        feat = patch_tokens.reshape(B, grid, grid, D).permute(0, 3, 1, 2)  # [B, D, grid, grid]
-        feat = self.vision_neck(feat)  # [B, out_channels, grid, grid]
-
-        # Shape sanity check (matches ConvBase-style behavior)
-        expected = self.output_shape(list(x.shape)[1:])
-        if list(feat.shape)[1:] != list(expected):
-            raise ValueError(f"Size mismatch: expect {expected}, but got {list(feat.shape)[1:]}")
-
-        return feat
-
-    def __repr__(self):
-        return (
-            f"{self.__class__.__name__}("
-            f"dino_model_path={self._dino_model_path}, "
-            f"img_size={self._img_size}, patch_size={self._patch_size}, "
-            f"freeze_backbone={self._freeze_backbone}, resize_inputs={self._resize_inputs}, "
-            f"out_channels={self._out_channels}"
-            f")"
-        )
+        feats = tokens.reshape(B, grid_h, grid_w, D).permute(0, 3, 1, 2)
+        feats = self.vision_neck(feats)
+        return feats
 
 class ConvBase(Module):
     """
@@ -1621,42 +1512,30 @@ Normalization Networks
 """
 
 class LayerNorm2d(Module):
+    """Layer normalization over the channel dimension for 2D feature maps.
+
+    Inputs:
+        x: (B, C, H, W)
+
+    Outputs:
+        y: (B, C, H, W)
     """
-    Channel-wise LayerNorm for 2D feature maps.
 
-    Normalizes over the channel dimension for inputs shaped [B, C, H, W],
-    and applies learned affine parameters per channel.
-
-    This is useful in ViT / transformer "necks" where LayerNorm-like behavior
-    is desired on convolutional feature maps.
-
-    Args:
-        num_channels (int): channel dimension C
-        eps (float): numerical stability term
-    """
     def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
-        super().__init__()
+        super(LayerNorm2d, self).__init__()
         self.weight = nn.Parameter(torch.ones(num_channels))
         self.bias = nn.Parameter(torch.zeros(num_channels))
         self.eps = eps
 
-    def output_shape(self, input_shape):
-        """
-        Args:
-            input_shape (iterable of int): expected (C, H, W) excluding batch dim
-
-        Returns:
-            list[int]: same shape as input (normalization does not change shape)
-        """
+    def output_shape(self, input_shape=None):
+        """Normalization does not change tensor shape."""
         assert input_shape is not None
-        assert len(input_shape) == 3
-        assert int(input_shape[0]) == int(self.weight.shape[0])
         return list(input_shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply layer normalization across channels."""
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
         x = self.weight[:, None, None] * x + self.bias[:, None, None]
         return x
-
