@@ -12,7 +12,7 @@ import robomimic.envs.env_base as EB
 class EnvPatcherOnline(EB.EnvBase):
     """
     Lightweight adapter that mirrors EnvPatcher's observation surface but allows
-    external producers (e.g. holypipette) to push live observations and feedback.
+    external producers (e.g. PatcherBot-Agent) to push live observations and feedback.
     """
 
     rollout_exceptions: Tuple = ()
@@ -25,7 +25,7 @@ class EnvPatcherOnline(EB.EnvBase):
         success_epsilon: float = 0.10,
         modalities: Optional[Mapping[str, str]] = None,
     ) -> None:
-        self.frame_stack = 1
+        self.frame_stack = 2
         self.success_epsilon = float(success_epsilon)
         self._obs_keys_order = list(obs_keys)
         self._modalities = dict(modalities or {})
@@ -38,6 +38,7 @@ class EnvPatcherOnline(EB.EnvBase):
         self._latest_error_vec: Optional[np.ndarray] = None
         self._t: int = 0
         self._success_flag: bool = False
+        self._goal: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # External data pumps
@@ -52,7 +53,7 @@ class EnvPatcherOnline(EB.EnvBase):
         extra: Optional[Mapping[str, np.ndarray]] = None,
     ) -> OrderedDict[str, np.ndarray]:
         """
-        Accept the raw holypipette observation tuple and store it in an OrderedDict
+        Accept the raw PatcherBot-Agent observation tuple and store it in an OrderedDict
         keyed to match EnvPatcher conventions.
         """
         obs = OrderedDict()
@@ -134,3 +135,78 @@ class EnvPatcherOnline(EB.EnvBase):
 
     def is_success(self) -> Dict[str, bool]:
         return {"task": bool(self._success_flag)}
+
+    # ------------------------------------------------------------------
+    # Abstract EnvBase API
+    # ------------------------------------------------------------------
+    @property
+    def action_dimension(self) -> int:
+        return int(self._action_dim) if self._action_dim is not None else 0
+
+    @property
+    def base_env(self):
+        return self
+
+    @property
+    def name(self) -> str:
+        return "PatcherOnline"
+
+    @property
+    def type(self) -> int:
+        return EB.EnvType.PATCHER_TYPE
+
+    def get_goal(self) -> Optional[Dict[str, Any]]:
+        return None if self._goal is None else dict(self._goal)
+
+    def set_goal(self, **kwargs) -> None:
+        self._goal = dict(kwargs) if kwargs else None
+
+    def get_reward(self) -> float:
+        return float(self._latest_reward)
+
+    def is_done(self) -> bool:
+        if "done" in self._latest_info:
+            return bool(self._latest_info["done"])
+        return bool(self._success_flag)
+
+    def render(self, mode: str = "human", height: Optional[int] = None, width: Optional[int] = None, camera_name: Optional[str] = None):
+        if mode == "rgb_array":
+            if "camera_image" in self._latest_obs:
+                return np.asarray(self._latest_obs["camera_image"])
+            return np.zeros((height or 1, width or 1, 3), dtype=np.uint8)
+        return None
+
+    def serialize(self) -> Dict[str, Any]:
+        return dict(
+            env_name=self.name,
+            type=self.type,
+            env_kwargs=dict(
+                obs_keys=list(self._obs_keys_order),
+                action_dim=self._action_dim,
+                success_epsilon=self.success_epsilon,
+                modalities=dict(self._modalities),
+                frame_stack=self.frame_stack,
+            ),
+        )
+
+    @classmethod
+    def create_for_data_processing(
+        cls,
+        camera_names=None,
+        camera_height=None,
+        camera_width=None,
+        reward_shaping=False,
+        render=None,
+        render_offscreen=None,
+        use_image_obs=None,
+        use_depth_obs=None,
+        **kwargs,
+    ):
+        default_keys = ["camera_image", "pipette_positions", "stage_positions", "resistance"]
+        default_modalities = {"rgb": ["camera_image"], "low_dim": ["pipette_positions", "stage_positions", "resistance"]}
+        return cls(
+            obs_keys=kwargs.get("obs_keys", default_keys),
+            action_dim=kwargs.get("action_dim"),
+            success_epsilon=kwargs.get("success_epsilon", 0.10),
+            modalities=kwargs.get("modalities", default_modalities),
+        )
