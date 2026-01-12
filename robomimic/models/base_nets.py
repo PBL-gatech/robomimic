@@ -19,14 +19,13 @@ from torchvision import transforms
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
 
-import sys
-import os
+import warnings
+from typing import Optional, Tuple, Union
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-
-from dinov2.dinov2.models.vision_transformer import vit_base
-
-from utils import LayerNorm2d
+# NOTE:
+# - Do NOT import dinov2 (Meta repo) at module import time.
+# - Do NOT import LayerNorm2d from a non-existent utils.py.
+# - LayerNorm2d is defined later in this file.
 
 
 
@@ -73,7 +72,6 @@ def transformer_args_from_config(transformer_config):
 
     return transformer_args
 
-
 class Module(torch.nn.Module):
     """
     Base class for networks. The only difference from torch.nn.Module is that it
@@ -93,10 +91,6 @@ class Module(torch.nn.Module):
             out_shape ([int]): list of integers corresponding to output shape
         """
         raise NotImplementedError
-
-
-
-
 
 class Sequential(torch.nn.Sequential, Module):
     """
@@ -145,7 +139,6 @@ class Sequential(torch.nn.Sequential, Module):
         else:
             super().train(mode)
 
-
 class Parameter(Module):
     """
     A class that is a thin wrapper around a torch.nn.Parameter to make for easy saving
@@ -179,7 +172,6 @@ class Parameter(Module):
         """
         return self.param
 
-
 class Unsqueeze(Module):
     """
     Trivial class that unsqueezes the input. Useful for including in a nn.Sequential network
@@ -194,7 +186,6 @@ class Unsqueeze(Module):
 
     def forward(self, x):
         return x.unsqueeze(dim=self.dim)
-
 
 class Squeeze(Module):
     """
@@ -211,7 +202,6 @@ class Squeeze(Module):
 
     def forward(self, x):
         return x.squeeze(dim=self.dim)
-
 
 class MLP(Module):
     """
@@ -313,7 +303,6 @@ class MLP(Module):
         msg = textwrap.indent(msg, indent)
         msg = header + '(\n' + msg + '\n)'
         return msg
-
 
 class RNN_Base(Module):
     """
@@ -488,160 +477,235 @@ class TransformerBase(Module):
         """Compute output shape from an input shape (excluding batch dimension)."""
         raise NotImplementedError
 
+class TransformersBase(TransformerBase):
+    """
+    Generic Hugging Face Transformers vision backbone wrapper.
 
-class DINOTransformer(TransformerBase):
-    """DINOv2 ViT visual backbone that outputs a 2D feature map.
+    Loads an HF vision model via AutoModel and returns a feature map:
+        (B, hidden_size, H_patch, W_patch)
 
-    Inputs:
-        x: (B, C, H, W) image tensor
-
-    Outputs:
-        feat: (B, out_channels, H // patch_size, W // patch_size) feature map
+    Important:
+    - Imports transformers lazily so robomimic doesn't require transformers unless used.
+    - Assumes token sequence is [CLS] + patch_tokens (no register tokens).
     """
 
     def __init__(
         self,
-        dino_model_path="./pretrained_dino_models/dino_domain_adaption_checkpoint_19999.pth",
-        img_size=896,
-        patch_size=14,
-        num_register_tokens=4,
-        init_values=1e-5,
-        out_channels=64,
-        freeze_backbone=False,
+        model_name_or_path: str,
+        pretrained: bool = True,
+        freeze_backbone: bool = False,
+        image_size: Optional[Union[int, Tuple[int, int]]] = None,
+        trust_remote_code: bool = False,
+        remove_cls_token: bool = True,
     ):
-        super(DINOTransformer, self).__init__()
+        super().__init__()
 
-        self._img_size = img_size
-        self._patch_size = patch_size
-        self._out_channels = out_channels
+        self._model_name_or_path = model_name_or_path
+        self._pretrained = pretrained
         self._freeze_backbone = freeze_backbone
+        self._remove_cls_token = remove_cls_token
 
-        # Target patch grid size implied by img_size and patch_size (used for pos_embed interpolation)
-        if isinstance(img_size, (tuple, list)):
-            target_h, target_w = int(img_size[0]), int(img_size[1])
-        else:
-            target_h = target_w = int(img_size)
-        self._target_grid_h = target_h // patch_size
-        self._target_grid_w = target_w // patch_size
+        # Lazy import: only required if this backbone is instantiated.
+        try:
+            from transformers import AutoConfig, AutoModel
+        except Exception as e:
+            raise ImportError(
+                "TransformersBase requires the 'transformers' package. "
+                "Install with: pip install transformers"
+            ) from e
 
-        # Load checkpoint and extract backbone weights
-        ckpt = torch.load(dino_model_path, map_location="cpu", weights_only=False)
-        teacher_state = ckpt.get("teacher", ckpt)
-
-        if any(k.startswith("backbone.") for k in teacher_state.keys()):
-            dino_backbone_weights = {
-                k[len("backbone."):]: v for k, v in teacher_state.items() if k.startswith("backbone.")
-            }
-        else:
-            # Assume weights are already backbone-only
-            dino_backbone_weights = dict(teacher_state)
-
-        # Infer embed dim from checkpoint (preferred)
-        embed_dim = None
-        if "patch_embed.proj.weight" in dino_backbone_weights:
-            embed_dim = int(dino_backbone_weights["patch_embed.proj.weight"].shape[0])
-
-        # Interpolate positional embeddings to match the target patch grid (if present)
-        if "pos_embed" in dino_backbone_weights:
-            dino_pos_embed = dino_backbone_weights["pos_embed"]  # (1, 1+N, D)
-
-            cls_token_pos_embed = dino_pos_embed[:, :1, :]
-            patch_pos_embed = dino_pos_embed[:, 1:, :]
-
-            # Original grid is typically square
-            orig_n = patch_pos_embed.shape[1]
-            orig_grid_h = int(round(orig_n ** 0.5))
-            orig_grid_w = orig_grid_h
-
-            patch_pos_embed = patch_pos_embed.permute(0, 2, 1).reshape(1, -1, orig_grid_h, orig_grid_w)
-
-            patch_pos_embed = F.interpolate(
-                patch_pos_embed,
-                size=(self._target_grid_h, self._target_grid_w),
-                mode="bicubic",
-                align_corners=False,
+        if pretrained:
+            self.hf_model = AutoModel.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=trust_remote_code,
             )
+            self.hf_config = self.hf_model.config
+        else:
+            self.hf_config = AutoConfig.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=trust_remote_code,
+            )
+            self.hf_model = AutoModel.from_config(self.hf_config)
 
-            patch_pos_embed = patch_pos_embed.flatten(2).permute(0, 2, 1)
-            dino_backbone_weights["pos_embed"] = torch.cat([cls_token_pos_embed, patch_pos_embed], dim=1)
+        # Infer common vision config fields
+        self._patch_size = self._infer_patch_size(self.hf_config)
+        self._hidden_size = self._infer_hidden_size(self.hf_config)
 
-        # Create DINOv2 ViT backbone and load weights
-        self.dino_encoder = vit_base(
-            img_size=img_size,
-            patch_size=patch_size,
-            block_chunks=0,
-            num_register_tokens=num_register_tokens,
-            init_values=init_values,
+        # If caller didn't specify, default to model config's image_size (if present)
+        if image_size is None:
+            image_size = getattr(self.hf_config, "image_size", None)
+        self._image_size = image_size  # may be None
+
+        if freeze_backbone:
+            for p in self.hf_model.parameters():
+                p.requires_grad = False
+            self.hf_model.eval()
+
+    @staticmethod
+    def _infer_patch_size(cfg) -> int:
+        ps = getattr(cfg, "patch_size", None)
+        if ps is None:
+            return 16
+        if isinstance(ps, (tuple, list)):
+            return int(ps[0])
+        return int(ps)
+
+    @staticmethod
+    def _infer_hidden_size(cfg) -> int:
+        hs = getattr(cfg, "hidden_size", None)
+        if hs is not None:
+            return int(hs)
+        hs = getattr(cfg, "hidden_dim", None)
+        if hs is not None:
+            return int(hs)
+        raise RuntimeError("TransformersBase: could not infer hidden size from HF config.")
+
+    @staticmethod
+    def _as_hw(sz: Union[int, Tuple[int, int], list]) -> Tuple[int, int]:
+        if isinstance(sz, (tuple, list)):
+            return int(sz[0]), int(sz[1])
+        return int(sz), int(sz)
+
+    def output_shape(self, input_shape):
+        """
+        Output feature map shape: [hidden_size, H_patch, W_patch]
+        """
+        assert input_shape is not None and len(input_shape) == 3  # (C, H, W)
+
+        if self._image_size is not None:
+            H, W = self._as_hw(self._image_size)
+        else:
+            H, W = int(input_shape[1]), int(input_shape[2])
+
+        return [self._hidden_size, H // self._patch_size, W // self._patch_size]
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self._freeze_backbone:
+            self.hf_model.eval()
+        return self
+
+    def _maybe_resize(self, x: torch.Tensor) -> torch.Tensor:
+        if self._image_size is None:
+            return x
+        Ht, Wt = self._as_hw(self._image_size)
+        if x.shape[-2] == Ht and x.shape[-1] == Wt:
+            return x
+        return F.interpolate(x, size=(Ht, Wt), mode="bilinear", align_corners=False)
+
+    def _tokens_to_feature_map(self, tokens: torch.Tensor, img_hw: Tuple[int, int]) -> torch.Tensor:
+        """
+        Convert (B, seq_len, hidden) -> (B, hidden, H_patch, W_patch)
+
+        Assumes [CLS] + patch_tokens.
+        """
+        assert tokens.ndim == 3
+        B, L, D = tokens.shape
+        H, W = img_hw
+        ps = self._patch_size
+        gh, gw = H // ps, W // ps
+
+        start = 1 if self._remove_cls_token else 0
+        patch_tokens = tokens[:, start:, :]  # (B, N, D)
+
+        N = patch_tokens.shape[1]
+        if gh * gw != N:
+            # fallback: square reshape if mismatch
+            s = int(round(N ** 0.5))
+            gh, gw = s, s
+
+        return patch_tokens.reshape(B, gh, gw, D).permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, hidden_size, H_patch, W_patch)
+        """
+        x = self._maybe_resize(x)
+
+        # HF vision models accept pixel_values kwarg
+        outputs = self.hf_model(pixel_values=x, **kwargs)
+
+        tokens = getattr(outputs, "last_hidden_state", None)
+        if tokens is None:
+            tokens = outputs[0]
+
+        if tokens.ndim == 4:
+            # already a feature map (B, C, H, W)
+            return tokens
+
+        return self._tokens_to_feature_map(tokens, img_hw=(x.shape[-2], x.shape[-1]))
+
+
+class DINOTransformer(TransformersBase):
+    """
+    DINOv2 (HF Transformers) visual backbone that outputs a 2D feature map.
+
+    - Uses Hugging Face AutoModel (e.g., "facebook/dinov2-base").
+    - Returns patch-grid features (B, out_channels, H_patch, W_patch).
+    - Does NOT depend on Meta dinov2 repo.
+    """
+
+    def __init__(
+        self,
+        model_name_or_path: str = "facebook/dinov2-base",
+        out_channels: int = 64,
+        freeze_backbone: bool = False,
+        image_size: Optional[Union[int, Tuple[int, int]]] = None,
+        pretrained: bool = True,
+        trust_remote_code: bool = False,
+        # Optional: load additional torch state dict (only if keys match HF model)
+        torch_state_dict_path: Optional[str] = None,
+    ):
+        super().__init__(
+            model_name_or_path=model_name_or_path,
+            pretrained=pretrained,
+            freeze_backbone=freeze_backbone,
+            image_size=image_size,
+            trust_remote_code=trust_remote_code,
+            remove_cls_token=True,
         )
 
-        # Fallback embed dim if not available from checkpoint
-        if embed_dim is None and hasattr(self.dino_encoder, "embed_dim"):
-            embed_dim = int(self.dino_encoder.embed_dim)
-        if embed_dim is None:
-            raise RuntimeError("DINOTransformer: could not infer DINO embedding dimension from checkpoint or model.")
+        self._out_channels = int(out_channels)
 
-        # Load weights (strict=False tolerates non-backbone keys / small mismatches)
-        self.dino_encoder.load_state_dict(dino_backbone_weights, strict=False)
+        # Optional external weight load (best effort)
+        if torch_state_dict_path is not None:
+            try:
+                ckpt = torch.load(torch_state_dict_path, map_location="cpu")
+                if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                    ckpt = ckpt["state_dict"]
+                if isinstance(ckpt, dict) and "teacher" in ckpt:
+                    ckpt = ckpt["teacher"]
 
-        # Optional freezing of the transformer backbone only
-        if freeze_backbone:
-            for p in self.dino_encoder.parameters():
-                p.requires_grad = False
-            self.dino_encoder.eval()
+                if isinstance(ckpt, dict) and any(k.startswith("backbone.") for k in ckpt.keys()):
+                    ckpt = {k[len("backbone."):]: v for k, v in ckpt.items() if k.startswith("backbone.")}
 
-        # Lightweight conv neck to produce a feature map compatible with SpatialSoftmax
+                missing, unexpected = self.hf_model.load_state_dict(ckpt, strict=False)
+                if len(missing) > 0 or len(unexpected) > 0:
+                    warnings.warn(
+                        f"DINOTransformer: loaded state_dict with missing={len(missing)} "
+                        f"unexpected={len(unexpected)} keys. This may be normal if formats differ."
+                    )
+            except Exception as e:
+                warnings.warn(f"DINOTransformer: failed to load torch_state_dict_path='{torch_state_dict_path}': {e}")
+
+        embed_dim = self._hidden_size
         self.vision_neck = nn.Sequential(
-            nn.Conv2d(embed_dim, out_channels, kernel_size=1, bias=False),
-            LayerNorm2d(out_channels),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            LayerNorm2d(out_channels),
+            nn.Conv2d(embed_dim, self._out_channels, kernel_size=1, bias=False),
+            LayerNorm2d(self._out_channels),
+            nn.Conv2d(self._out_channels, self._out_channels, kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(self._out_channels),
         )
 
     def output_shape(self, input_shape):
-        """Compute output shape from input image shape.
+        base = super().output_shape(input_shape)  # [hidden_size, H_patch, W_patch]
+        return [self._out_channels, base[1], base[2]]
 
-        Args:
-            input_shape: (C, H, W)
-
-        Returns:
-            [out_channels, H // patch_size, W // patch_size]
-        """
-        assert input_shape is not None and len(input_shape) == 3
-        grid_h = int(input_shape[1] // self._patch_size)
-        grid_w = int(input_shape[2] // self._patch_size)
-        return [self._out_channels, grid_h, grid_w]
-
-    def train(self, mode=True):
-        """Set training mode while keeping a frozen backbone in eval mode."""
-        super(DINOTransformer, self).train(mode)
-        if self._freeze_backbone:
-            self.dino_encoder.eval()
-        return self
-
-    def forward(self, x, **kwargs):
-        """Forward pass.
-
-        Args:
-            x: (B, C, H, W)
-
-        Returns:
-            (B, out_channels, H // patch_size, W // patch_size)
-        """
-        tokens = self.dino_encoder(x)["x_norm_patchtokens"]
-
-        B, N, D = tokens.shape
-        grid_h = int(x.shape[-2] // self._patch_size)
-        grid_w = int(x.shape[-1] // self._patch_size)
-
-        # If the runtime grid doesn't match the token count, fall back to square reshape
-        if grid_h * grid_w != N:
-            s = int(round(N ** 0.5))
-            grid_h = s
-            grid_w = s
-
-        feats = tokens.reshape(B, grid_h, grid_w, D).permute(0, 3, 1, 2)
-        feats = self.vision_neck(feats)
-        return feats
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        feats = super().forward(x, **kwargs)   # (B, hidden_size, H_patch, W_patch)
+        return self.vision_neck(feats)
 
 class ConvBase(Module):
     """

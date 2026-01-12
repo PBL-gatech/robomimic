@@ -454,7 +454,7 @@ def main(args):
     # catch error during training and print it
     res_str = "finished run successfully!"
     try:
-        train(config, device=device, resume=True)
+        train(config, device=device, resume=False)
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
     print(res_str)
@@ -470,7 +470,7 @@ if __name__ == "__main__":
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\NeuronHunting\bc\bc-PatcherBot_v0_041.json", # neuron hunting with lstm
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\df-PatcherBot_v0_003.json", # neuron hunting with diffusion
         # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\bc\bc-PatcherBot_v0_511.json", # pipette finding with lstm
-        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_511.json", # pipette finding with diffusion
+        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_513.json", # pipette finding with diffusion
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
     )
