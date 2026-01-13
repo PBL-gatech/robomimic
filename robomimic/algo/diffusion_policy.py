@@ -2,6 +2,7 @@
 Implementation of Diffusion Policy https://diffusion-policy.cs.columbia.edu/ by Cheng Chi
 """
 from typing import Callable, Union
+import copy
 import math
 from collections import OrderedDict, deque
 from packaging.version import parse as parse_version
@@ -108,13 +109,22 @@ class DiffusionPolicyUNet(PolicyAlgo):
         
         # setup EMA
         ema = None
+        ema_model = None
         if self.algo_config.ema.enabled:
-            ema = EMAModel(model=nets, power=self.algo_config.ema.power)
+            ema = EMAModel(
+                parameters=nets.parameters(),
+                power=self.algo_config.ema.power,
+                use_ema_warmup=True,
+            )
+            ema_model = copy.deepcopy(nets)
+            ema_model.requires_grad_(False)
+            ema_model.eval()
 
         # set attrs
         self.nets = nets
         self.noise_scheduler = noise_scheduler
         self.ema = ema
+        self.ema_model = ema_model
         self.action_check_done = False
         self.obs_queue = None
         self.action_queue = None
@@ -231,7 +241,9 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 
                 # update Exponential Moving Average of the model weights
                 if self.ema is not None:
-                    self.ema.step(self.nets)
+                    self.ema.step(self.nets.parameters())
+                    if self.ema_model is not None:
+                        self.ema.copy_to(self.ema_model.parameters())
                 
                 step_info = {
                     "policy_grad_norms": policy_grad_norms
@@ -315,8 +327,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
         
         # select network
         nets = self.nets
-        if self.ema is not None:
-            nets = self.ema.averaged_model
+        if self.ema_model is not None:
+            nets = self.ema_model
         
         # encode obs
         inputs = {
@@ -366,6 +378,48 @@ class DiffusionPolicyUNet(PolicyAlgo):
         action = naction[:,start:end]
         return action
 
+    def _ema_state_dict(self):
+        if self.ema is None:
+            return None
+        if self.ema_model is not None:
+            return self.ema_model.state_dict()
+        ema_state = self.nets.state_dict()
+        param_items = list(self.nets.named_parameters())
+        if len(param_items) != len(self.ema.shadow_params):
+            raise RuntimeError("EMA parameter count mismatch.")
+        for (name, _), shadow in zip(param_items, self.ema.shadow_params):
+            ema_state[name] = shadow.detach().to(device=ema_state[name].device, dtype=ema_state[name].dtype).clone()
+        return ema_state
+
+    def _sync_ema_from_model(self):
+        if self.ema is None or self.ema_model is None:
+            return
+        ema_params = list(self.ema_model.parameters())
+        if len(ema_params) != len(self.ema.shadow_params):
+            raise RuntimeError("EMA parameter count mismatch.")
+        for shadow, param in zip(self.ema.shadow_params, ema_params):
+            shadow.data.copy_(param.detach().to(device=shadow.device, dtype=shadow.dtype))
+
+    def _load_ema_state_dict(self, ema_state_dict):
+        if ema_state_dict is None or self.ema is None:
+            return
+        if "shadow_params" in ema_state_dict:
+            self.ema.load_state_dict(ema_state_dict)
+            if self.ema_model is not None:
+                self.ema.copy_to(self.ema_model.parameters())
+            return
+        if self.ema_model is not None:
+            self.ema_model.load_state_dict(ema_state_dict)
+            self._sync_ema_from_model()
+            return
+        param_items = list(self.nets.named_parameters())
+        if len(param_items) != len(self.ema.shadow_params):
+            raise RuntimeError("EMA parameter count mismatch.")
+        for (name, _), shadow in zip(param_items, self.ema.shadow_params):
+            if name not in ema_state_dict:
+                raise KeyError(f"EMA state dict missing parameter '{name}'")
+            shadow.data.copy_(ema_state_dict[name].to(device=shadow.device, dtype=shadow.dtype))
+
     def serialize(self):
         """
         Get dictionary of current model parameters.
@@ -374,7 +428,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
             "nets": self.nets.state_dict(),
             "optimizers": { k : self.optimizers[k].state_dict() for k in self.optimizers },
             "lr_schedulers": { k : self.lr_schedulers[k].state_dict() if self.lr_schedulers[k] is not None else None for k in self.lr_schedulers },
-            "ema": self.ema.averaged_model.state_dict() if self.ema is not None else None,
+            "ema": self._ema_state_dict(),
         }
 
     def deserialize(self, model_dict, load_optimizers=False):
@@ -396,7 +450,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
             model_dict["lr_schedulers"] = {}
 
         if model_dict.get("ema", None) is not None:
-            self.ema.averaged_model.load_state_dict(model_dict["ema"])
+            self._load_ema_state_dict(model_dict["ema"])
 
         if load_optimizers:
             for k in model_dict["optimizers"]:
