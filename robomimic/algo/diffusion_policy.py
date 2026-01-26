@@ -52,6 +52,17 @@ def algo_config_to_class(algo_config):
         raise RuntimeError()
 
 class DiffusionPolicyUNet(PolicyAlgo):
+    # Helpers to safely access optional scheduler configs that might be absent
+    def _cfg_or_none(self, name):
+        try:
+            return getattr(self.algo_config, name)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_enabled(cfg):
+        return bool(getattr(cfg, "enabled", False)) if cfg is not None else False
+
     def _create_networks(self):
         """
         Creates networks and places them into @self.nets.
@@ -89,35 +100,38 @@ class DiffusionPolicyUNet(PolicyAlgo):
         nets = nets.float().to(self.device)
         
         # setup noise scheduler
+        flowmatch_cfg = self._cfg_or_none("flowmatch")
+        ddpm_cfg = self._cfg_or_none("ddpm")
+        ddim_cfg = self._cfg_or_none("ddim")
         noise_scheduler = None
-        if self.algo_config.flowmatch.enabled:
-            scheduler_type = self.algo_config.flowmatch.scheduler_type.lower()
+        if self._is_enabled(flowmatch_cfg):
+            scheduler_type = flowmatch_cfg.scheduler_type.lower()
             flowmatch_kwargs = {
-                "num_train_timesteps": self.algo_config.flowmatch.num_train_timesteps,
+                "num_train_timesteps": flowmatch_cfg.num_train_timesteps,
             }
-            if self.algo_config.flowmatch.shift is not None:
-                flowmatch_kwargs["shift"] = self.algo_config.flowmatch.shift
+            if getattr(flowmatch_cfg, "shift", None) is not None:
+                flowmatch_kwargs["shift"] = flowmatch_cfg.shift
             if scheduler_type == "euler":
                 noise_scheduler = FlowMatchEulerDiscreteScheduler(**flowmatch_kwargs)
             elif scheduler_type == "heun":
                 noise_scheduler = FlowMatchHeunDiscreteScheduler(**flowmatch_kwargs)
             else:
                 raise ValueError(f"Unsupported flowmatch scheduler_type: {scheduler_type}")
-        elif self.algo_config.ddpm.enabled:
+        elif self._is_enabled(ddpm_cfg):
             noise_scheduler = DDPMScheduler(
-                num_train_timesteps=self.algo_config.ddpm.num_train_timesteps,
-                beta_schedule=self.algo_config.ddpm.beta_schedule,
-                clip_sample=self.algo_config.ddpm.clip_sample,
-                prediction_type=self.algo_config.ddpm.prediction_type
+                num_train_timesteps=ddpm_cfg.num_train_timesteps,
+                beta_schedule=ddpm_cfg.beta_schedule,
+                clip_sample=ddpm_cfg.clip_sample,
+                prediction_type=ddpm_cfg.prediction_type
             )
-        elif self.algo_config.ddim.enabled:
+        elif self._is_enabled(ddim_cfg):
             noise_scheduler = DDIMScheduler(
-                num_train_timesteps=self.algo_config.ddim.num_train_timesteps,
-                beta_schedule=self.algo_config.ddim.beta_schedule,
-                clip_sample=self.algo_config.ddim.clip_sample,
-                set_alpha_to_one=self.algo_config.ddim.set_alpha_to_one,
-                steps_offset=self.algo_config.ddim.steps_offset,
-                prediction_type=self.algo_config.ddim.prediction_type
+                num_train_timesteps=ddim_cfg.num_train_timesteps,
+                beta_schedule=ddim_cfg.beta_schedule,
+                clip_sample=ddim_cfg.clip_sample,
+                set_alpha_to_one=ddim_cfg.set_alpha_to_one,
+                steps_offset=ddim_cfg.steps_offset,
+                prediction_type=ddim_cfg.prediction_type
             )
         else:
             raise RuntimeError()
@@ -221,8 +235,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
             
             # sample noise to add to actions
             noise = torch.randn(actions.shape, device=self.device)
-            
-            if self.algo_config.flowmatch.enabled:
+
+            if self._is_enabled(self._cfg_or_none("flowmatch")):
                 timesteps = torch.rand((B,), device=self.device)
                 t = timesteps.view(B, 1, 1)
                 noisy_actions = (1.0 - t) * actions + t * noise
@@ -344,12 +358,15 @@ class DiffusionPolicyUNet(PolicyAlgo):
         Ta = self.algo_config.horizon.action_horizon
         Tp = self.algo_config.horizon.prediction_horizon
         action_dim = self.ac_dim
-        if self.algo_config.flowmatch.enabled is True:
-            num_inference_timesteps = self.algo_config.flowmatch.num_inference_timesteps
-        elif self.algo_config.ddpm.enabled is True:
-            num_inference_timesteps = self.algo_config.ddpm.num_inference_timesteps
-        elif self.algo_config.ddim.enabled is True:
-            num_inference_timesteps = self.algo_config.ddim.num_inference_timesteps
+        flowmatch_cfg = self._cfg_or_none("flowmatch")
+        ddpm_cfg = self._cfg_or_none("ddpm")
+        ddim_cfg = self._cfg_or_none("ddim")
+        if self._is_enabled(flowmatch_cfg):
+            num_inference_timesteps = flowmatch_cfg.num_inference_timesteps
+        elif self._is_enabled(ddpm_cfg):
+            num_inference_timesteps = ddpm_cfg.num_inference_timesteps
+        elif self._is_enabled(ddim_cfg):
+            num_inference_timesteps = ddim_cfg.num_inference_timesteps
         else:
             raise ValueError
         
@@ -383,7 +400,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         naction = noisy_action
         
         # init scheduler
-        if self.algo_config.flowmatch.enabled:
+        if self._is_enabled(flowmatch_cfg):
             try:
                 self.noise_scheduler.set_timesteps(num_inference_timesteps, device=self.device)
             except TypeError:
