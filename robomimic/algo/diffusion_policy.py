@@ -13,6 +13,8 @@ import torch.nn.functional as F
 # requires diffusers==0.11.1
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_heun_discrete import FlowMatchHeunDiscreteScheduler
 from diffusers.training_utils import EMAModel
 
 import robomimic.models.obs_nets as ObsNets
@@ -88,7 +90,20 @@ class DiffusionPolicyUNet(PolicyAlgo):
         
         # setup noise scheduler
         noise_scheduler = None
-        if self.algo_config.ddpm.enabled:
+        if self.algo_config.flowmatch.enabled:
+            scheduler_type = self.algo_config.flowmatch.scheduler_type.lower()
+            flowmatch_kwargs = {
+                "num_train_timesteps": self.algo_config.flowmatch.num_train_timesteps,
+            }
+            if self.algo_config.flowmatch.shift is not None:
+                flowmatch_kwargs["shift"] = self.algo_config.flowmatch.shift
+            if scheduler_type == "euler":
+                noise_scheduler = FlowMatchEulerDiscreteScheduler(**flowmatch_kwargs)
+            elif scheduler_type == "heun":
+                noise_scheduler = FlowMatchHeunDiscreteScheduler(**flowmatch_kwargs)
+            else:
+                raise ValueError(f"Unsupported flowmatch scheduler_type: {scheduler_type}")
+        elif self.algo_config.ddpm.enabled:
             noise_scheduler = DDPMScheduler(
                 num_train_timesteps=self.algo_config.ddpm.num_train_timesteps,
                 beta_schedule=self.algo_config.ddpm.beta_schedule,
@@ -207,23 +222,34 @@ class DiffusionPolicyUNet(PolicyAlgo):
             # sample noise to add to actions
             noise = torch.randn(actions.shape, device=self.device)
             
-            # sample a diffusion iteration for each data point
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.num_train_timesteps, 
-                (B,), device=self.device
-            ).long()
-            
-            # add noise to the clean actions according to the noise magnitude at each diffusion iteration
-            # (this is the forward diffusion process)
-            noisy_actions = self.noise_scheduler.add_noise(
-                actions, noise, timesteps)
-            
-            # predict the noise residual
-            noise_pred = self.nets["policy"]["noise_pred_net"](
-                noisy_actions, timesteps, global_cond=obs_cond)
-            
-            # L2 loss
-            loss = F.mse_loss(noise_pred, noise)
+            if self.algo_config.flowmatch.enabled:
+                timesteps = torch.rand((B,), device=self.device)
+                t = timesteps.view(B, 1, 1)
+                noisy_actions = (1.0 - t) * actions + t * noise
+                
+                noise_pred = self.nets["policy"]["noise_pred_net"](
+                    noisy_actions, timesteps, global_cond=obs_cond)
+                
+                v_target = actions - noise
+                loss = F.mse_loss(noise_pred, v_target)
+            else:
+                # sample a diffusion iteration for each data point
+                timesteps = torch.randint(
+                    0, self.noise_scheduler.config.num_train_timesteps, 
+                    (B,), device=self.device
+                ).long()
+                
+                # add noise to the clean actions according to the noise magnitude at each diffusion iteration
+                # (this is the forward diffusion process)
+                noisy_actions = self.noise_scheduler.add_noise(
+                    actions, noise, timesteps)
+                
+                # predict the noise residual
+                noise_pred = self.nets["policy"]["noise_pred_net"](
+                    noisy_actions, timesteps, global_cond=obs_cond)
+                
+                # L2 loss
+                loss = F.mse_loss(noise_pred, noise)
             
             # logging
             losses = {
@@ -318,7 +344,9 @@ class DiffusionPolicyUNet(PolicyAlgo):
         Ta = self.algo_config.horizon.action_horizon
         Tp = self.algo_config.horizon.prediction_horizon
         action_dim = self.ac_dim
-        if self.algo_config.ddpm.enabled is True:
+        if self.algo_config.flowmatch.enabled is True:
+            num_inference_timesteps = self.algo_config.flowmatch.num_inference_timesteps
+        elif self.algo_config.ddpm.enabled is True:
             num_inference_timesteps = self.algo_config.ddpm.num_inference_timesteps
         elif self.algo_config.ddim.enabled is True:
             num_inference_timesteps = self.algo_config.ddim.num_inference_timesteps
@@ -355,7 +383,13 @@ class DiffusionPolicyUNet(PolicyAlgo):
         naction = noisy_action
         
         # init scheduler
-        self.noise_scheduler.set_timesteps(num_inference_timesteps)
+        if self.algo_config.flowmatch.enabled:
+            try:
+                self.noise_scheduler.set_timesteps(num_inference_timesteps, device=self.device)
+            except TypeError:
+                self.noise_scheduler.set_timesteps(num_inference_timesteps)
+        else:
+            self.noise_scheduler.set_timesteps(num_inference_timesteps)
 
         for k in self.noise_scheduler.timesteps:
             # predict noise
@@ -366,11 +400,15 @@ class DiffusionPolicyUNet(PolicyAlgo):
             )
 
             # inverse diffusion step (remove noise)
-            naction = self.noise_scheduler.step(
+            step_output = self.noise_scheduler.step(
                 model_output=noise_pred,
                 timestep=k,
                 sample=naction
-            ).prev_sample
+            )
+            if hasattr(step_output, "prev_sample"):
+                naction = step_output.prev_sample
+            else:
+                naction = step_output[0]
 
         # process action using Ta
         start = To - 1

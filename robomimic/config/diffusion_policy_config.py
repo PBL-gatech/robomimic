@@ -77,3 +77,10 @@ class DiffusionPolicyConfig(BaseConfig):
         self.algo.ddim.set_alpha_to_one = True
         self.algo.ddim.steps_offset = 0
         self.algo.ddim.prediction_type = 'epsilon'
+
+        ## Flow Matching
+        self.algo.flowmatch.enabled = False
+        self.algo.flowmatch.scheduler_type = "euler"
+        self.algo.flowmatch.num_train_timesteps = 100
+        self.algo.flowmatch.num_inference_timesteps = 100
+        self.algo.flowmatch.shift = 1.0
