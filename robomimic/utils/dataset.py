@@ -816,6 +816,7 @@ def _compute_traj_stats(traj_obs_dict):
         traj_stats[k]["max"] = traj_obs_dict[k].max(axis=0, keepdims=True)
     return traj_stats
 
+
 def _aggregate_traj_stats(traj_stats_a, traj_stats_b):
     """
     Helper function to aggregate trajectory statistics.
