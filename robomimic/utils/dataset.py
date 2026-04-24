@@ -676,6 +676,159 @@ class SequenceDataset(torch.utils.data.Dataset):
         return None
 
 
+class EventAwareSequenceDataset(SequenceDataset):
+    """
+    SequenceDataset variant that labels and oversamples sparse intervention events.
+    This is intended for sparse mixed-action layouts with one continuous command
+    dimension and one binary state dimension.
+    """
+    def __init__(
+        self,
+        *args,
+        event_halo=3,
+        event_mixture=None,
+        continuous_index=0,
+        binary_index=1,
+        continuous_eps=1e-6,
+        sampler_enabled=True,
+        **kwargs,
+    ):
+        self.event_halo = int(event_halo)
+        if event_mixture is None:
+            event_mixture = dict(event=0.3, pre_event=0.2, background=0.5)
+        self.event_mixture = event_mixture
+        self.continuous_index = int(continuous_index)
+        self.binary_index = int(binary_index)
+        self.continuous_eps = float(continuous_eps)
+        self.sampler_enabled = sampler_enabled
+        self._event_traces = None
+        self._binary_traces = None
+        self._sample_weights = None
+        self._sample_buckets = None
+        super(EventAwareSequenceDataset, self).__init__(*args, **kwargs)
+
+    def load_demo_info(self, *args, **kwargs):
+        super(EventAwareSequenceDataset, self).load_demo_info(*args, **kwargs)
+        self._event_traces, self._binary_traces = self._build_demo_traces()
+        self._sample_buckets, self._sample_weights = self._build_sample_weights()
+
+    def _raw_actions_for_demo(self, demo_id):
+        assert len(self.action_keys) == 1, "EventAwareSequenceDataset expects a single action vector key"
+        action_key = self.action_keys[0]
+        actions = self.hdf5_file["data/{}/{}".format(demo_id, action_key)][()].astype("float32")
+        if actions.ndim == 1:
+            actions = actions.reshape(-1, 1)
+        return actions
+
+    def _traces_for_demo(self, demo_id):
+        actions = self._raw_actions_for_demo(demo_id)
+        assert actions.shape[-1] > max(self.continuous_index, self.binary_index), (
+            "EventAwareSequenceDataset action indices exceed action dimension"
+        )
+
+        continuous_action = actions[:, self.continuous_index]
+        binary_action = actions[:, self.binary_index]
+        events = np.zeros(actions.shape[0], dtype=np.float32)
+        if events.shape[0] == 0:
+            return events, binary_action.astype(np.float32)
+
+        events[0] = 1.0
+        continuous_events = np.abs(continuous_action) > self.continuous_eps
+        events[continuous_events] = 1.0
+        if events.shape[0] > 1:
+            binary_events = binary_action[1:] != binary_action[:-1]
+            events[1:][binary_events] = 1.0
+        return events, binary_action.astype(np.float32)
+
+    def _build_demo_traces(self):
+        event_traces = {}
+        binary_traces = {}
+        for demo_id in self.demos:
+            event_traces[demo_id], binary_traces[demo_id] = self._traces_for_demo(demo_id)
+        return event_traces, binary_traces
+
+    def _index_in_demo_from_dataset_index(self, index):
+        demo_id = self._index_to_demo_id[index]
+        demo_start_index = self._demo_id_to_start_indices[demo_id]
+        demo_index_offset = 0 if self.pad_frame_stack else (self.n_frame_stack - 1)
+        return demo_id, index - demo_start_index + demo_index_offset
+
+    def _valid_supervised_indices(self, demo_id, index_in_demo):
+        demo_length = self._demo_id_to_demo_length[demo_id]
+        start = max(0, index_in_demo)
+        end = min(index_in_demo + self.seq_length, demo_length)
+        if end <= start:
+            return np.array([], dtype=np.int64)
+        return np.arange(start, end, dtype=np.int64)
+
+    def _pad_mask_for_index(self, demo_id, index_in_demo):
+        demo_length = self._demo_id_to_demo_length[demo_id]
+        num_frames_to_stack = self.n_frame_stack - 1
+        seq_begin_index = max(0, index_in_demo - num_frames_to_stack)
+        seq_end_index = min(demo_length, index_in_demo + self.seq_length)
+        seq_begin_pad = max(0, num_frames_to_stack - index_in_demo)
+        seq_end_pad = max(0, index_in_demo + self.seq_length - demo_length)
+        valid_len = seq_end_index - seq_begin_index
+        pad_mask = np.array(
+            [0] * seq_begin_pad + [1] * valid_len + [0] * seq_end_pad,
+            dtype=bool,
+        )
+        return pad_mask[:self.seq_length, None]
+
+    def _sequence_values_for_index(self, trace, demo_id, index_in_demo):
+        labels = np.zeros((self.seq_length,), dtype=np.float32)
+        valid_indices = self._valid_supervised_indices(demo_id, index_in_demo)
+        if valid_indices.shape[0] > 0:
+            labels[:valid_indices.shape[0]] = trace[valid_indices]
+        return labels[:, None]
+
+    def _build_sample_weights(self):
+        buckets = np.zeros(len(self), dtype=np.int64)  # 0 background, 1 pre-event, 2 event
+        for index in range(len(self)):
+            demo_id, index_in_demo = self._index_in_demo_from_dataset_index(index)
+            event_trace = self._event_traces[demo_id]
+            supervised_indices = self._valid_supervised_indices(demo_id, index_in_demo)
+
+            if supervised_indices.shape[0] > 0 and np.any(event_trace[supervised_indices] > 0):
+                buckets[index] = 2
+                continue
+
+            future_start = max(0, index_in_demo)
+            future_events = np.where(event_trace[future_start:] > 0)[0]
+            if future_events.shape[0] > 0 and future_events[0] <= self.event_halo:
+                buckets[index] = 1
+
+        counts = np.bincount(buckets, minlength=3).astype(np.float64)
+        counts = np.clip(counts, a_min=1.0, a_max=None)
+        target_mass = np.array([
+            float(self.event_mixture.get("background", 0.5)),
+            float(self.event_mixture.get("pre_event", 0.2)),
+            float(self.event_mixture.get("event", 0.3)),
+        ], dtype=np.float64)
+        target_mass = target_mass / np.sum(target_mass)
+        weights = target_mass[buckets] / counts[buckets]
+        return buckets, weights
+
+    def get_item(self, index):
+        meta = super(EventAwareSequenceDataset, self).get_item(index)
+        demo_id, index_in_demo = self._index_in_demo_from_dataset_index(index)
+        event_label = self._sequence_values_for_index(self._event_traces[demo_id], demo_id, index_in_demo)
+        meta["event_label"] = event_label
+        meta["binary_label"] = self._sequence_values_for_index(self._binary_traces[demo_id], demo_id, index_in_demo)
+        meta["event_weight"] = np.ones_like(event_label, dtype=np.float32)
+        meta["pad_mask"] = self._pad_mask_for_index(demo_id, index_in_demo)
+        return meta
+
+    def get_dataset_sampler(self):
+        if not self.sampler_enabled:
+            return None
+        return CustomWeightedRandomSampler(
+            weights=self._sample_weights,
+            num_samples=len(self),
+            replacement=True,
+        )
+
+
 class CustomWeightedRandomSampler(torch.utils.data.WeightedRandomSampler):
     def __init__(self, *args, **kwargs):
         """

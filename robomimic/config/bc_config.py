@@ -10,10 +10,14 @@ class BCConfig(BaseConfig):
 
     def train_config(self):
         """
-        BC algorithms don't need "next_obs" from hdf5 - so save on storage and compute by disabling it.
+        BC can need "next_obs" for goal conditioning when train.goal_mode is "last".
         """
         super(BCConfig, self).train_config()
-        self.train.hdf5_load_next_obs = False
+        self.train.event_sampler.enabled = False
+        self.train.event_sampler.halo = 3
+        self.train.event_sampler.mixture.event = 0.3
+        self.train.event_sampler.mixture.pre_event = 0.2
+        self.train.event_sampler.mixture.background = 0.5
 
     def algo_config(self):
         """
@@ -36,6 +40,17 @@ class BCConfig(BaseConfig):
         self.algo.loss.l2_weight = 1.0      # L2 loss weight
         self.algo.loss.l1_weight = 0.0      # L1 loss weight
         self.algo.loss.cos_weight = 0.0     # cosine loss weight
+
+        # gated mixed-action settings
+        self.algo.gated_action.enabled = False
+        self.algo.gated_action.continuous_index = 0
+        self.algo.gated_action.binary_index = 1
+        self.algo.gated_action.act_threshold = 0.5
+        self.algo.gated_action.initial_binary = 1.0
+        self.algo.gated_action.continuous_eps = 1e-6
+        self.algo.gated_action.loss_weights.act = 1.0
+        self.algo.gated_action.loss_weights.continuous = 1.0
+        self.algo.gated_action.loss_weights.binary = 1.0
 
         # MLP network architecture (layers after observation encoder and RNN, if present)
         self.algo.actor_layer_dims = (1024, 1024)

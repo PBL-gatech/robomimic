@@ -510,6 +510,8 @@ class RolloutPolicy(object):
         self.policy = policy
         self.obs_normalization_stats = obs_normalization_stats
         self.action_normalization_stats = action_normalization_stats
+        if self.action_normalization_stats is not None and hasattr(self.policy, "set_action_normalization_stats"):
+            self.policy.set_action_normalization_stats(self.action_normalization_stats)
 
     def start_episode(self):
         """

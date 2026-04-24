@@ -23,7 +23,7 @@ import robomimic.utils.log_utils as LogUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.lang_utils as LangUtils
 
-from robomimic.utils.dataset import SequenceDataset, MetaDataset
+from robomimic.utils.dataset import SequenceDataset, EventAwareSequenceDataset, MetaDataset
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
@@ -169,6 +169,14 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
     else:
         ds_langs = [None for _ in config.train.data]
 
+    event_sampler_enabled = ("event_sampler" in config.train) and config.train.event_sampler.enabled
+    is_validation_dataset = (
+        filter_by_attribute is not None and
+        config.train.hdf5_validation_filter_key is not None and
+        filter_by_attribute == config.train.hdf5_validation_filter_key
+    )
+    ds_class = EventAwareSequenceDataset if event_sampler_enabled else SequenceDataset
+
     ds_kwargs = dict(
         hdf5_path=dataset_path,
         obs_keys=obs_keys,
@@ -188,6 +196,20 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         filter_by_attribute=filter_by_attribute,
     )
 
+    if event_sampler_enabled:
+        ds_kwargs.update(dict(
+            event_halo=config.train.event_sampler.halo,
+            event_mixture=dict(
+                event=config.train.event_sampler.mixture.event,
+                pre_event=config.train.event_sampler.mixture.pre_event,
+                background=config.train.event_sampler.mixture.background,
+            ),
+            continuous_index=config.algo.gated_action.continuous_index,
+            binary_index=config.algo.gated_action.binary_index,
+            continuous_eps=config.algo.gated_action.continuous_eps,
+            sampler_enabled=(not is_validation_dataset),
+        ))
+
     ds_kwargs["hdf5_path"] = [ds_cfg["path"] for ds_cfg in config.train.data]
     ds_kwargs["filter_by_attribute"] = [ds_cfg.get("filter_key", filter_by_attribute) for ds_cfg in config.train.data]
     ds_kwargs["demo_limit"] = [ds_cfg.get("demo_limit", None) for ds_cfg in config.train.data]
@@ -196,7 +218,7 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
     meta_ds_kwargs = dict()
 
     dataset = get_dataset(
-        ds_class=SequenceDataset,
+        ds_class=ds_class,
         ds_kwargs=ds_kwargs,
         ds_weights=ds_weights,
         ds_langs=ds_langs,

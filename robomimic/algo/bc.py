@@ -38,12 +38,17 @@ def algo_config_to_class(algo_config):
     gaussian_enabled = ("gaussian" in algo_config and algo_config.gaussian.enabled)
     gmm_enabled = ("gmm" in algo_config and algo_config.gmm.enabled)
     vae_enabled = ("vae" in algo_config and algo_config.vae.enabled)
+    gated_action_enabled = ("gated_action" in algo_config and algo_config.gated_action.enabled)
 
     rnn_enabled = algo_config.rnn.enabled
     # support legacy configs that do not have "transformer" item
     transformer_enabled = ("transformer" in algo_config) and algo_config.transformer.enabled
 
-    if gaussian_enabled:
+    if gated_action_enabled:
+        if gaussian_enabled or gmm_enabled or vae_enabled or transformer_enabled or not rnn_enabled:
+            raise NotImplementedError("gated_action is only implemented for deterministic BC-RNN")
+        algo_class, algo_kwargs = BC_RNN_GatedAction, {}
+    elif gaussian_enabled:
         if rnn_enabled:
             raise NotImplementedError
         elif transformer_enabled:
@@ -573,6 +578,153 @@ class BC_RNN(BC):
         """
         self._rnn_hidden_state = None
         self._rnn_counter = 0
+
+
+class BC_RNN_GatedAction(BC_RNN):
+    """
+    BC-RNN with separate intervention, continuous-command, and binary-state heads.
+    """
+    def _create_networks(self):
+        self.nets = nn.ModuleDict()
+        self.nets["policy"] = PolicyNets.RNNGatedActionNetwork(
+            obs_shapes=self.obs_shapes,
+            goal_shapes=self.goal_shapes,
+            ac_dim=self.ac_dim,
+            mlp_layer_dims=self.algo_config.actor_layer_dims,
+            encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+            **BaseNets.rnn_args_from_config(self.algo_config.rnn),
+        )
+
+        self._rnn_hidden_state = None
+        self._rnn_horizon = self.algo_config.rnn.horizon
+        self._rnn_counter = 0
+        self._rnn_is_open_loop = self.algo_config.rnn.get("open_loop", False)
+        self._open_loop_obs = None
+        self._last_raw_binary = None
+        self._action_norm_offset = None
+        self._action_norm_scale = None
+
+        self.nets = self.nets.float().to(self.device)
+
+    def set_action_normalization_stats(self, action_normalization_stats):
+        action_key = self.global_config.train.action_keys[0]
+        stats = action_normalization_stats[action_key]
+        offset = torch.as_tensor(stats["offset"], dtype=torch.float32, device=self.device).reshape(-1)
+        scale = torch.as_tensor(stats["scale"], dtype=torch.float32, device=self.device).reshape(-1)
+        self._action_norm_offset = offset
+        self._action_norm_scale = scale
+
+    def process_batch_for_training(self, batch):
+        input_batch = super(BC_RNN_GatedAction, self).process_batch_for_training(batch)
+        input_batch["event_label"] = batch["event_label"]
+        input_batch["event_weight"] = batch["event_weight"]
+        input_batch["pad_mask"] = batch["pad_mask"]
+        input_batch["binary_label"] = batch["binary_label"]
+        return TensorUtils.to_float(TensorUtils.to_device(input_batch, self.device))
+
+    def _forward_training(self, batch):
+        return self.nets["policy"](obs_dict=batch["obs"], goal_dict=batch["goal_obs"])
+
+    def _weighted_mean(self, loss, weight):
+        weight = weight.to(dtype=loss.dtype)
+        return (loss * weight).sum() / weight.sum().clamp(min=1e-6)
+
+    def _compute_losses(self, predictions, batch):
+        losses = OrderedDict()
+        cfg = self.algo_config.gated_action
+        continuous_index = cfg.continuous_index
+
+        event_label = batch["event_label"].squeeze(-1)
+        event_weight = batch["event_weight"].squeeze(-1)
+        pad_mask = batch["pad_mask"].squeeze(-1).to(dtype=event_label.dtype)
+        binary_label = batch["binary_label"].squeeze(-1)
+        continuous_target = batch["actions"][..., continuous_index]
+
+        sample_weight = event_weight * pad_mask
+        event_sample_weight = sample_weight * event_label
+
+        act_loss = F.binary_cross_entropy_with_logits(
+            predictions["act_logits"], event_label, reduction="none")
+        continuous_loss = F.smooth_l1_loss(
+            predictions["continuous"], continuous_target, reduction="none")
+        binary_loss = F.binary_cross_entropy_with_logits(
+            predictions["binary_logits"], binary_label, reduction="none")
+
+        losses["act_loss"] = self._weighted_mean(act_loss, sample_weight)
+        losses["continuous_loss"] = self._weighted_mean(continuous_loss, event_sample_weight)
+        losses["binary_loss"] = self._weighted_mean(binary_loss, event_sample_weight)
+
+        losses["action_loss"] = (
+            cfg.loss_weights.act * losses["act_loss"] +
+            cfg.loss_weights.continuous * losses["continuous_loss"] +
+            cfg.loss_weights.binary * losses["binary_loss"]
+        )
+        return losses
+
+    def _normalize_raw_dim(self, dim, raw_value):
+        if self._action_norm_offset is None or self._action_norm_scale is None:
+            return raw_value
+        return (raw_value - self._action_norm_offset[dim]) / self._action_norm_scale[dim]
+
+    def _ensure_rollout_state(self, batch_size):
+        if self._last_raw_binary is None or self._last_raw_binary.shape[0] != batch_size:
+            initial_binary = float(self.algo_config.gated_action.initial_binary)
+            self._last_raw_binary = torch.full((batch_size,), initial_binary, dtype=torch.float32, device=self.device)
+
+    def get_action(self, obs_dict, goal_dict=None):
+        assert not self.nets.training
+
+        if self._rnn_hidden_state is None or self._rnn_counter % self._rnn_horizon == 0:
+            batch_size = list(obs_dict.values())[0].shape[0]
+            self._rnn_hidden_state = self.nets["policy"].get_rnn_init_state(batch_size=batch_size, device=self.device)
+            self._ensure_rollout_state(batch_size=batch_size)
+
+            if self._rnn_is_open_loop:
+                self._open_loop_obs = TensorUtils.clone(TensorUtils.detach(obs_dict))
+
+        obs_to_use = obs_dict
+        if self._rnn_is_open_loop:
+            obs_to_use = self._open_loop_obs
+
+        self._rnn_counter += 1
+        predictions, self._rnn_hidden_state = self.nets["policy"].forward_step(
+            obs_to_use, goal_dict=goal_dict, rnn_state=self._rnn_hidden_state)
+
+        cfg = self.algo_config.gated_action
+        continuous_index = cfg.continuous_index
+        binary_index = cfg.binary_index
+        batch_size = predictions["act_logits"].shape[0]
+        self._ensure_rollout_state(batch_size=batch_size)
+
+        should_act = torch.sigmoid(predictions["act_logits"]) > cfg.act_threshold
+        predicted_raw_binary = (torch.sigmoid(predictions["binary_logits"]) > 0.5).to(dtype=torch.float32)
+        next_raw_binary = torch.where(should_act, predicted_raw_binary, self._last_raw_binary)
+
+        actions = torch.zeros((batch_size, self.ac_dim), dtype=torch.float32, device=self.device)
+        raw_zero_continuous = torch.zeros((batch_size,), dtype=torch.float32, device=self.device)
+        actions[:, continuous_index] = torch.where(
+            should_act,
+            predictions["continuous"],
+            self._normalize_raw_dim(continuous_index, raw_zero_continuous),
+        )
+        actions[:, binary_index] = self._normalize_raw_dim(binary_index, next_raw_binary)
+
+        self._last_raw_binary = next_raw_binary.detach()
+        return actions
+
+    def reset(self):
+        super(BC_RNN_GatedAction, self).reset()
+        self._last_raw_binary = None
+
+    def log_info(self, info):
+        log = PolicyAlgo.log_info(self, info)
+        log["Loss"] = info["losses"]["action_loss"].item()
+        log["Act_Loss"] = info["losses"]["act_loss"].item()
+        log["Continuous_Loss"] = info["losses"]["continuous_loss"].item()
+        log["Binary_Loss"] = info["losses"]["binary_loss"].item()
+        if "policy_grad_norms" in info:
+            log["Policy_Grad_Norms"] = info["policy_grad_norms"]
+        return log
 
 
 class BC_RNN_GMM(BC_RNN):

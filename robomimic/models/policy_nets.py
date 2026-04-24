@@ -725,6 +725,64 @@ class RNNActorNetwork(RNN_MIMO_MLP):
         return "action_dim={}".format(self.ac_dim)
 
 
+class RNNGatedActionNetwork(RNNActorNetwork):
+    """
+    RNN policy network with separate heads for intervention, one continuous
+    command, and one binary state.
+    """
+    def _get_output_shapes(self):
+        return OrderedDict(
+            act_logits=(1,),
+            continuous=(1,),
+            binary_logits=(1,),
+        )
+
+    def output_shape(self, input_shape):
+        mod = list(self.obs_shapes.keys())[0]
+        T = input_shape[mod][0]
+        TensorUtils.assert_size_at_dim(input_shape, size=T, dim=0,
+                msg="RNNGatedActionNetwork: input_shape inconsistent in temporal dimension")
+        return OrderedDict(
+            act_logits=[T],
+            continuous=[T],
+            binary_logits=[T],
+        )
+
+    def forward(self, obs_dict, goal_dict=None, rnn_init_state=None, return_state=False):
+        if self._is_goal_conditioned:
+            assert goal_dict is not None
+            mod = list(obs_dict.keys())[0]
+            goal_dict = TensorUtils.unsqueeze_expand_at(goal_dict, size=obs_dict[mod].shape[1], dim=1)
+
+        outputs = RNN_MIMO_MLP.forward(
+            self, obs=obs_dict, goal=goal_dict, rnn_init_state=rnn_init_state, return_state=return_state)
+
+        if return_state:
+            outputs, state = outputs
+        else:
+            state = None
+
+        predictions = OrderedDict()
+        predictions["act_logits"] = outputs["act_logits"].squeeze(-1)
+        predictions["continuous"] = torch.tanh(outputs["continuous"]).squeeze(-1)
+        predictions["binary_logits"] = outputs["binary_logits"].squeeze(-1)
+
+        if return_state:
+            return predictions, state
+        return predictions
+
+    def forward_step(self, obs_dict, goal_dict=None, rnn_state=None):
+        obs_dict = TensorUtils.to_sequence(obs_dict)
+        predictions, state = self.forward(
+            obs_dict, goal_dict, rnn_init_state=rnn_state, return_state=True)
+        predictions = OrderedDict((k, v[:, 0]) for k, v in predictions.items())
+        return predictions, state
+
+    def _to_string(self):
+        """Info to pretty print."""
+        return "gated_action_dim={}".format(self.ac_dim)
+
+
 class RNNGMMActorNetwork(RNNActorNetwork):
     """
     An RNN GMM policy network that predicts sequences of action distributions from observation sequences.
