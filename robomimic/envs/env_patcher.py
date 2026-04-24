@@ -27,6 +27,26 @@ class EnvPatcher(EB.EnvBase):
 
     rollout_exceptions = ()
 
+    @staticmethod
+    def _decode_demo_keys(keys: Iterable[Any]) -> Sequence[str]:
+        return sorted(key.decode("utf-8") if isinstance(key, bytes) else str(key) for key in keys)
+
+    @classmethod
+    def _resolve_demo_key(cls, demo_id: Optional[Any], demo_keys: Sequence[str]) -> str:
+        if not demo_keys:
+            raise ValueError("No demos found in dataset")
+        if demo_id is None:
+            return demo_keys[0]
+        if isinstance(demo_id, (int, np.integer)):
+            idx = int(demo_id)
+            if idx < 0 or idx >= len(demo_keys):
+                raise IndexError(f"demo_id index {idx} is out of range for {len(demo_keys)} demos")
+            return demo_keys[idx]
+        demo_key = demo_id.decode("utf-8") if isinstance(demo_id, bytes) else str(demo_id)
+        if demo_key not in demo_keys:
+            raise KeyError(f"demo_id '{demo_key}' not found in dataset")
+        return demo_key
+
     def __init__(
         self,
         dataset_path: str = None,
@@ -73,9 +93,10 @@ class EnvPatcher(EB.EnvBase):
         self._obs_keys_order = self._collect_requested_obs_keys()
 
         with h5py.File(self.dataset_path, "r") as h5:
-            if demo_id is None:
-                demo_id = sorted(h5["data"].keys())[0] # make sure it is same as in run_PatcherBot_agent.py for now
+            self._demo_keys = self._decode_demo_keys(h5["data"].keys())
+            demo_id = self._resolve_demo_key(demo_id, self._demo_keys)
             self._demo_id = demo_id
+            self._demo_index = self._demo_keys.index(self._demo_id)
             print(f"[EnvPatcher] loading demo_id={self._demo_id} from {self.dataset_path}")
             obs_group_path = f"data/{demo_id}/obs"
             root_group_path = f"data/{demo_id}"
@@ -347,7 +368,7 @@ class EnvPatcher(EB.EnvBase):
         return
 
     def __repr__(self):
-        return f"EnvPatcher(demo_id={self._demo_id}, N={self._N})"
+        return f"EnvPatcher(demo_id={self._demo_id}, demo_index={getattr(self, '_demo_index', None)}, N={self._N})"
 
     def get_goal(self):
         return self._observation_at_index(self._goal_index)
@@ -471,6 +492,7 @@ class EnvPatcher(EB.EnvBase):
             env_kwargs=dict(
                 dataset_path=self.dataset_path,
                 demo_id=self._demo_id,
+                demo_index=getattr(self, "_demo_index", None),
                 image_key=self.image_key,
                 pipette_key=self.pipette_key,
                 stage_key=self.stage_key,

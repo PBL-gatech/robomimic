@@ -5,6 +5,7 @@ import json
 import statistics
 import time
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, List
 from pathlib import Path
 from datetime import datetime
@@ -15,6 +16,7 @@ import numpy as np
 
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.torch_utils as TorchUtils
+from robomimic.utils.patcherbot_eval import evaluate_patcherbot_checkpoints
 
 from robomimic.envs.env_patcher import create_env_patcher
 
@@ -279,21 +281,22 @@ def _summarize_losses(loss_totals: Dict[str, list]) -> str:
 def main():
 
     #behaviorial cloning with LSTM paths
-    bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\v0_511\20251020214217"
-    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_511\results_bc_PatcherBot_v0_511_0.csv"
-    bc_json_path =  r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\PipetteFinding\results\v0_511\metadata_bc_PatcherBot_v0_511_0.json"
+    bc_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\Gigasealing\v0_840\20260422160005"
+    bc_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\Gigasealing\results\v0_840\results_bc_PatcherBot_v0_840_0.csv"
+    bc_json_path =  r"C:\Users\sa-forest\Documents\GitHub\robomimic\bc_patcherBot\Gigasealing\results\v0_840\metadata_bc_PatcherBot_v0_840_0.json"
 
     # diffusion policy paths
-    df_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_511\20251021171105"
-    df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_511\results_df_PatcherBot_v0_511_0.csv"
-    df_json_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_511\metadata_df_PatcherBot_v0_511_0.json"
+    # df_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\v0_511\20251021171105"
+    # df_csv_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_511\results_df_PatcherBot_v0_511_0.csv"
+    # df_json_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\df_patcherBot\PipetteFinding\results\v0_511\metadata_df_PatcherBot_v0_511_0.json"
 
     #datapaths
-    data_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBot_test_dataset_v0_510\PatcherBot_test_dataset_v0_510_find_pipette.hdf5" # test data
+    # data_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBot_test_dataset_v0_510\PatcherBot_test_dataset_v0_510_find_pipette.hdf5" # test data
+    data_path = r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Datasets\PatcherBot_test_dataset_v0_840\PatcherBot_test_dataset_v0_840_gigaseal.hdf5"
     training_data_path = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\PipetteFinding\PatcherBot_dataset_v0_510_find_pipette.hdf5" # training data
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent", required=False, default = df_path,  help="Path to .pth checkpoint")
+    ap.add_argument("--agent", required=False, default = bc_path,  help="Path to .pth checkpoint")
     ap.add_argument("--dataset", required=False,
                     default = data_path,  
                     # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\data\PipetteFinding\PatcherBot_dataset_v0_120_find_pipette.hdf5",
@@ -302,9 +305,24 @@ def main():
     ap.add_argument("--frame_stack", type=int, default=None, help="Frame stack override; defaults to policy config")
     ap.add_argument("--eps", type=float, default=-1.0)
     ap.add_argument("--show_pos_traj", action="store_true", default = True,help="compute positional trajectory error like HuntTester")
-    ap.add_argument("--per_step_csv", type=str, default= df_csv_path , help="Optional path to save per-step action errors as CSV")
-    ap.add_argument("--rollout_metadata",type= str, default= df_json_path, help="Optional path to save rollout metadata as JSON")
+    ap.add_argument("--per_step_csv", type=str, default= bc_csv_path , help="Optional path to save per-step action errors as CSV")
+    ap.add_argument("--rollout_metadata",type= str, default= bc_json_path, help="Optional path to save rollout metadata as JSON")
     args = ap.parse_args()
+
+    shared_config = SimpleNamespace(
+        dataset_path=args.dataset,
+        csv_dir=str(Path(args.per_step_csv).expanduser().parent) if args.per_step_csv else str(Path(bc_csv_path).expanduser().parent),
+        metadata_dir=str(Path(args.rollout_metadata).expanduser().parent) if args.rollout_metadata else str(Path(bc_json_path).expanduser().parent),
+        output_dir=str(Path(args.per_step_csv).expanduser().parent) if args.per_step_csv else str(Path(bc_csv_path).expanduser().parent),
+        horizon=args.horizon,
+        eps=args.eps,
+        show_pos_traj=args.show_pos_traj,
+        frame_stack=args.frame_stack,
+        demo_id=None,
+        evaluate_all_demos=True,
+    )
+    evaluate_patcherbot_checkpoints(args.agent, shared_config)
+    return
 
     ckpt_paths = _resolve_checkpoints(args.agent)
     multi_ckpt = len(ckpt_paths) > 1
