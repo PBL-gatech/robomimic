@@ -18,6 +18,7 @@ class BCConfig(BaseConfig):
         self.train.event_sampler.mixture.event = 0.3
         self.train.event_sampler.mixture.pre_event = 0.2
         self.train.event_sampler.mixture.background = 0.5
+        self.train.event_sampler.continuous_eps = 1e-6
 
     def algo_config(self):
         """
@@ -41,16 +42,18 @@ class BCConfig(BaseConfig):
         self.algo.loss.l1_weight = 0.0      # L1 loss weight
         self.algo.loss.cos_weight = 0.0     # cosine loss weight
 
-        # gated mixed-action settings
-        self.algo.gated_action.enabled = False
-        self.algo.gated_action.continuous_index = 0
-        self.algo.gated_action.binary_index = 1
-        self.algo.gated_action.act_threshold = 0.5
-        self.algo.gated_action.initial_binary = 1.0
-        self.algo.gated_action.continuous_eps = 1e-6
-        self.algo.gated_action.loss_weights.act = 1.0
-        self.algo.gated_action.loss_weights.continuous = 1.0
-        self.algo.gated_action.loss_weights.binary = 1.0
+        # action head settings
+        self.algo.action_head.type = "continuous"  # one of ["continuous", "mixed"]
+        self.algo.action_head.continuous_indices = []
+        self.algo.action_head.binary_indices = []
+        self.algo.action_head.gate.enabled = False
+        self.algo.action_head.gate.threshold = 0.5
+        self.algo.action_head.noop.continuous_raw_values = []
+        self.algo.action_head.noop.binary_mode = "repeat_last"
+        self.algo.action_head.noop.initial_binary_values = []
+        self.algo.action_head.loss_weights.gate = 1.0
+        self.algo.action_head.loss_weights.continuous = 1.0
+        self.algo.action_head.loss_weights.binary = 1.0
 
         # MLP network architecture (layers after observation encoder and RNN, if present)
         self.algo.actor_layer_dims = (1024, 1024)

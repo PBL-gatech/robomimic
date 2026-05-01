@@ -392,6 +392,13 @@ class SequenceDataset(torch.utils.data.Dataset):
     def set_action_normalization_stats(self, action_normalization_stats):
         self.action_normalization_stats = action_normalization_stats
 
+    def get_action_identity_indices(self):
+        """
+        Return action dimensions that should use identity normalization, keyed by
+        action key.
+        """
+        return action_config_to_identity_indices(self.action_config)
+
     def get_action_normalization_stats(self):
         """
         Computes a dataset-wide min, max, mean and standard deviation for the actions 
@@ -404,6 +411,10 @@ class SequenceDataset(torch.utils.data.Dataset):
             action_stats = self.get_action_stats()
             self.action_normalization_stats = action_stats_to_normalization_stats(
                 action_stats, self.action_config)
+            apply_action_identity_indices(
+                self.action_normalization_stats,
+                self.get_action_identity_indices(),
+            )
         return self.action_normalization_stats
 
     def get_dataset_for_ep(self, ep, key):
@@ -679,28 +690,37 @@ class SequenceDataset(torch.utils.data.Dataset):
 class EventAwareSequenceDataset(SequenceDataset):
     """
     SequenceDataset variant that labels and oversamples sparse intervention events.
-    This is intended for sparse mixed-action layouts with one continuous command
-    dimension and one binary state dimension.
+    Event labels are built from raw HDF5 actions before action normalization.
     """
     def __init__(
         self,
         *args,
         event_halo=3,
         event_mixture=None,
-        continuous_index=0,
-        binary_index=1,
+        continuous_indices=None,
+        binary_indices=None,
+        noop_continuous_raw_values=None,
         continuous_eps=1e-6,
         sampler_enabled=True,
+        supervision_mode="sequence",
         **kwargs,
     ):
         self.event_halo = int(event_halo)
         if event_mixture is None:
             event_mixture = dict(event=0.3, pre_event=0.2, background=0.5)
         self.event_mixture = event_mixture
-        self.continuous_index = int(continuous_index)
-        self.binary_index = int(binary_index)
+        self.continuous_indices = [int(i) for i in (continuous_indices or [])]
+        self.binary_indices = [int(i) for i in (binary_indices or [])]
+        if noop_continuous_raw_values is None:
+            noop_continuous_raw_values = [0.0 for _ in self.continuous_indices]
+        self.noop_continuous_raw_values = np.array(noop_continuous_raw_values, dtype=np.float32).reshape(-1)
+        assert len(self.noop_continuous_raw_values) == len(self.continuous_indices), (
+            "EventAwareSequenceDataset expected one no-op raw value per continuous action index"
+        )
         self.continuous_eps = float(continuous_eps)
-        self.sampler_enabled = sampler_enabled
+        self.sampler_enabled = bool(sampler_enabled)
+        assert supervision_mode in ("first", "sequence", "last")
+        self.supervision_mode = supervision_mode
         self._event_traces = None
         self._binary_traces = None
         self._sample_weights = None
@@ -720,25 +740,43 @@ class EventAwareSequenceDataset(SequenceDataset):
             actions = actions.reshape(-1, 1)
         return actions
 
+    def get_action_identity_indices(self):
+        identity_indices = super(EventAwareSequenceDataset, self).get_action_identity_indices()
+        if len(self.binary_indices) > 0:
+            assert len(self.action_keys) == 1, "EventAwareSequenceDataset expects a single action vector key"
+            action_key = self.action_keys[0]
+            existing = identity_indices.get(action_key, [])
+            identity_indices[action_key] = sorted(set(existing + self.binary_indices))
+        return identity_indices
+
     def _traces_for_demo(self, demo_id):
         actions = self._raw_actions_for_demo(demo_id)
-        assert actions.shape[-1] > max(self.continuous_index, self.binary_index), (
-            "EventAwareSequenceDataset action indices exceed action dimension"
-        )
+        action_indices = self.continuous_indices + self.binary_indices
+        if len(action_indices) > 0:
+            assert actions.shape[-1] > max(action_indices), (
+                "EventAwareSequenceDataset action indices exceed action dimension"
+            )
 
-        continuous_action = actions[:, self.continuous_index]
-        binary_action = actions[:, self.binary_index]
         events = np.zeros(actions.shape[0], dtype=np.float32)
         if events.shape[0] == 0:
-            return events, binary_action.astype(np.float32)
+            return events, np.zeros((0, len(self.binary_indices)), dtype=np.float32)
 
         events[0] = 1.0
-        continuous_events = np.abs(continuous_action) > self.continuous_eps
-        events[continuous_events] = 1.0
-        if events.shape[0] > 1:
-            binary_events = binary_action[1:] != binary_action[:-1]
-            events[1:][binary_events] = 1.0
-        return events, binary_action.astype(np.float32)
+        if len(self.continuous_indices) > 0:
+            continuous_actions = actions[:, self.continuous_indices]
+            continuous_noops = self.noop_continuous_raw_values.reshape(1, -1)
+            continuous_events = np.any(np.abs(continuous_actions - continuous_noops) > self.continuous_eps, axis=-1)
+            events[continuous_events] = 1.0
+
+        if len(self.binary_indices) > 0:
+            binary_actions = actions[:, self.binary_indices]
+            if events.shape[0] > 1:
+                binary_events = np.any(binary_actions[1:] != binary_actions[:-1], axis=-1)
+                events[1:][binary_events] = 1.0
+        else:
+            binary_actions = np.zeros((actions.shape[0], 0), dtype=np.float32)
+
+        return events, binary_actions.astype(np.float32)
 
     def _build_demo_traces(self):
         event_traces = {}
@@ -754,6 +792,18 @@ class EventAwareSequenceDataset(SequenceDataset):
         return demo_id, index - demo_start_index + demo_index_offset
 
     def _valid_supervised_indices(self, demo_id, index_in_demo):
+        demo_length = self._demo_id_to_demo_length[demo_id]
+        start = max(0, index_in_demo)
+        end = min(index_in_demo + self.seq_length, demo_length)
+        if end <= start:
+            return np.array([], dtype=np.int64)
+        if self.supervision_mode == "first":
+            return np.array([start], dtype=np.int64)
+        if self.supervision_mode == "last":
+            return np.array([end - 1], dtype=np.int64)
+        return np.arange(start, end, dtype=np.int64)
+
+    def _valid_sequence_indices(self, demo_id, index_in_demo):
         demo_length = self._demo_id_to_demo_length[demo_id]
         start = max(0, index_in_demo)
         end = min(index_in_demo + self.seq_length, demo_length)
@@ -776,11 +826,14 @@ class EventAwareSequenceDataset(SequenceDataset):
         return pad_mask[:self.seq_length, None]
 
     def _sequence_values_for_index(self, trace, demo_id, index_in_demo):
-        labels = np.zeros((self.seq_length,), dtype=np.float32)
-        valid_indices = self._valid_supervised_indices(demo_id, index_in_demo)
+        trace_shape = trace.shape[1:] if trace.ndim > 1 else ()
+        labels = np.zeros((self.seq_length,) + trace_shape, dtype=np.float32)
+        valid_indices = self._valid_sequence_indices(demo_id, index_in_demo)
         if valid_indices.shape[0] > 0:
             labels[:valid_indices.shape[0]] = trace[valid_indices]
-        return labels[:, None]
+        if labels.ndim == 1:
+            labels = labels[:, None]
+        return labels
 
     def _build_sample_weights(self):
         buckets = np.zeros(len(self), dtype=np.int64)  # 0 background, 1 pre-event, 2 event
@@ -814,7 +867,7 @@ class EventAwareSequenceDataset(SequenceDataset):
         demo_id, index_in_demo = self._index_in_demo_from_dataset_index(index)
         event_label = self._sequence_values_for_index(self._event_traces[demo_id], demo_id, index_in_demo)
         meta["event_label"] = event_label
-        meta["binary_label"] = self._sequence_values_for_index(self._binary_traces[demo_id], demo_id, index_in_demo)
+        meta["binary_labels"] = self._sequence_values_for_index(self._binary_traces[demo_id], demo_id, index_in_demo)
         meta["event_weight"] = np.ones_like(event_label, dtype=np.float32)
         meta["pad_mask"] = self._pad_mask_for_index(demo_id, index_in_demo)
         return meta
@@ -891,6 +944,10 @@ class MetaDataset(torch.utils.data.Dataset):
         action_stats = self.get_action_stats()
         self.action_normalization_stats = action_stats_to_normalization_stats(
             action_stats, self.datasets[0].action_config)
+        apply_action_identity_indices(
+            self.action_normalization_stats,
+            self.datasets[0].get_action_identity_indices(),
+        )
         self.set_action_normalization_stats(self.action_normalization_stats)
     
     def __len__(self):
@@ -954,7 +1011,63 @@ class MetaDataset(torch.utils.data.Dataset):
             action_stats = self.get_action_stats()
             self.action_normalization_stats = action_stats_to_normalization_stats(
                 action_stats, self.datasets[0].action_config)
+            apply_action_identity_indices(
+                self.action_normalization_stats,
+                self.datasets[0].get_action_identity_indices(),
+            )
         return self.action_normalization_stats
+
+
+def action_config_to_identity_indices(action_config):
+    """
+    Extract per-action dimensions that should not be normalized. Supported
+    aliases keep this config extension explicit without tying it to one caller.
+    """
+    identity_indices = OrderedDict()
+    identity_keys = (
+        "identity_indices",
+        "normalization_identity_indices",
+        "normalization_exclude_indices",
+    )
+    for action_key, cfg in action_config.items():
+        indices = []
+        for identity_key in identity_keys:
+            indices.extend([int(i) for i in cfg.get(identity_key, [])])
+        if len(indices) > 0:
+            identity_indices[action_key] = sorted(set(indices))
+    return identity_indices
+
+
+def apply_action_identity_indices(action_normalization_stats, identity_indices):
+    """
+    Force selected dimensions to use raw action values by setting scale=1 and
+    offset=0 in the normalization stats.
+    """
+    for action_key, indices in identity_indices.items():
+        if len(indices) == 0:
+            continue
+        if action_key not in action_normalization_stats:
+            raise KeyError("identity normalization requested for unknown action key '{}'".format(action_key))
+
+        stats = action_normalization_stats[action_key]
+        scale = stats["scale"]
+        offset = stats["offset"]
+        indices = [int(i) for i in indices]
+        if min(indices) < 0:
+            raise ValueError(
+                "identity normalization indices must be non-negative for key '{}': {}".format(
+                    action_key, indices)
+            )
+        max_index = max(indices)
+        if scale.shape[-1] <= max_index:
+            raise ValueError(
+                "identity normalization indices {} exceed action dimension {} for key '{}'".format(
+                    indices, scale.shape[-1], action_key)
+            )
+
+        scale[..., indices] = 1.0
+        offset[..., indices] = 0.0
+
 
 def _compute_traj_stats(traj_obs_dict):
     """
@@ -1066,4 +1179,9 @@ def action_stats_to_normalization_stats(action_stats, action_config):
             raise NotImplementedError(
                 'action_config.actions.normalization: "{}" is not supported'.format(norm_method))
     
+    apply_action_identity_indices(
+        action_normalization_stats,
+        action_config_to_identity_indices(action_config),
+    )
+
     return action_normalization_stats

@@ -7,8 +7,11 @@ to see stdout output).
 import argparse
 from collections import OrderedDict
 
+import numpy as np
+
 import robomimic
 from robomimic.config import Config
+from robomimic.utils.dataset import EventAwareSequenceDataset, action_stats_to_normalization_stats
 import robomimic.utils.test_utils as TestUtils
 from robomimic.utils.log_utils import silence_stdout
 from robomimic.utils.torch_utils import dummy_context_mgr
@@ -66,6 +69,44 @@ def convert_config_for_images(config):
     config.observation.encoder.rgb.obs_randomizer_class = None
 
     return config
+
+
+def test_mixed_binary_actions_keep_identity_normalization():
+    action_stats = OrderedDict(
+        actions=dict(
+            n=4,
+            mean=np.array([[40.0, 0.5]], dtype=np.float32),
+            sqdiff=np.ones((1, 2), dtype=np.float32),
+            min=np.array([[-50.0, 0.0]], dtype=np.float32),
+            max=np.array([[130.0, 1.0]], dtype=np.float32),
+        )
+    )
+
+    dataset = object.__new__(EventAwareSequenceDataset)
+    dataset._hdf5_file = None
+    dataset.action_config = {"actions": {"normalization": "min_max"}}
+    dataset.action_keys = ("actions",)
+    dataset.binary_indices = [1]
+
+    identity_indices = dataset.get_action_identity_indices()
+    assert identity_indices == {"actions": [1]}
+
+    action_config = {
+        "actions": {
+            "normalization": "min_max",
+            "identity_indices": identity_indices["actions"],
+        }
+    }
+    stats = action_stats_to_normalization_stats(action_stats, action_config)
+
+    np.testing.assert_allclose(stats["actions"]["scale"][0, 1], 1.0)
+    np.testing.assert_allclose(stats["actions"]["offset"][0, 1], 0.0)
+
+    raw_actions = np.array([[-50.0, 0.0], [130.0, 1.0]], dtype=np.float32)
+    normalized = (raw_actions - stats["actions"]["offset"]) / stats["actions"]["scale"]
+    np.testing.assert_allclose(normalized[:, 1], raw_actions[:, 1])
+    assert normalized[0, 0] < -0.99
+    assert normalized[1, 0] > 0.99
 
 
 def make_image_modifier(config_modifier):

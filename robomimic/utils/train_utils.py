@@ -170,12 +170,16 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         ds_langs = [None for _ in config.train.data]
 
     event_sampler_enabled = ("event_sampler" in config.train) and config.train.event_sampler.enabled
+    mixed_action_enabled = (
+        ("action_head" in config.algo) and
+        (config.algo.action_head.type == "mixed")
+    )
     is_validation_dataset = (
         filter_by_attribute is not None and
         config.train.hdf5_validation_filter_key is not None and
         filter_by_attribute == config.train.hdf5_validation_filter_key
     )
-    ds_class = EventAwareSequenceDataset if event_sampler_enabled else SequenceDataset
+    ds_class = EventAwareSequenceDataset if (event_sampler_enabled or mixed_action_enabled) else SequenceDataset
 
     ds_kwargs = dict(
         hdf5_path=dataset_path,
@@ -196,7 +200,22 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         filter_by_attribute=filter_by_attribute,
     )
 
-    if event_sampler_enabled:
+    if event_sampler_enabled or mixed_action_enabled:
+        if event_sampler_enabled and (
+            len(config.algo.action_head.continuous_indices) + len(config.algo.action_head.binary_indices) == 0
+        ):
+            raise ValueError(
+                "train.event_sampler.enabled requires action_head continuous_indices and / or binary_indices "
+                "so event labels can be computed"
+            )
+
+        if config.algo.rnn.enabled:
+            supervision_mode = "sequence"
+        elif ("transformer" in config.algo) and config.algo.transformer.enabled:
+            supervision_mode = "sequence" if config.algo.transformer.supervise_all_steps else "last"
+        else:
+            supervision_mode = "first"
+
         ds_kwargs.update(dict(
             event_halo=config.train.event_sampler.halo,
             event_mixture=dict(
@@ -204,10 +223,12 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
                 pre_event=config.train.event_sampler.mixture.pre_event,
                 background=config.train.event_sampler.mixture.background,
             ),
-            continuous_index=config.algo.gated_action.continuous_index,
-            binary_index=config.algo.gated_action.binary_index,
-            continuous_eps=config.algo.gated_action.continuous_eps,
-            sampler_enabled=(not is_validation_dataset),
+            continuous_indices=list(config.algo.action_head.continuous_indices),
+            binary_indices=list(config.algo.action_head.binary_indices),
+            noop_continuous_raw_values=list(config.algo.action_head.noop.continuous_raw_values),
+            continuous_eps=config.train.event_sampler.continuous_eps,
+            sampler_enabled=(event_sampler_enabled and not is_validation_dataset),
+            supervision_mode=supervision_mode,
         ))
 
     ds_kwargs["hdf5_path"] = [ds_cfg["path"] for ds_cfg in config.train.data]
@@ -800,6 +821,33 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
                 step_log_dict[k] = []
             step_log_dict[k].append(step_log_all[i][k])
     step_log_all = dict((k, float(np.mean(v))) for k, v in step_log_dict.items())
+
+    gate_count_keys = ("Gate_TP", "Gate_FP", "Gate_FN")
+    if all(k in step_log_dict for k in gate_count_keys):
+        gate_tp = float(np.sum(step_log_dict["Gate_TP"]))
+        gate_fp = float(np.sum(step_log_dict["Gate_FP"]))
+        gate_fn = float(np.sum(step_log_dict["Gate_FN"]))
+        gate_pred_count = gate_tp + gate_fp
+        gate_true_count = gate_tp + gate_fn
+
+        gate_precision = gate_tp / max(gate_pred_count, 1.0)
+        gate_recall = gate_tp / max(gate_true_count, 1.0)
+        step_log_all["Gate_Precision"] = gate_precision
+        step_log_all["Gate_Recall"] = gate_recall
+        step_log_all["Gate_F1"] = (
+            (2.0 * gate_precision * gate_recall) / max(gate_precision + gate_recall, 1e-6)
+        )
+        step_log_all["Gate_TP"] = gate_tp
+        step_log_all["Gate_FP"] = gate_fp
+        step_log_all["Gate_FN"] = gate_fn
+        step_log_all["Gate_Pred_Count"] = gate_pred_count
+        step_log_all["Gate_True_Count"] = gate_true_count
+
+        if "Gate_Valid_Count" in step_log_dict:
+            gate_valid_count = float(np.sum(step_log_dict["Gate_Valid_Count"]))
+            step_log_all["Gate_Valid_Count"] = gate_valid_count
+            step_log_all["Gate_True_Rate"] = gate_true_count / max(gate_valid_count, 1.0)
+            step_log_all["Gate_Pred_Rate"] = gate_pred_count / max(gate_valid_count, 1.0)
 
     # add in timing stats
     for k in timing_stats:

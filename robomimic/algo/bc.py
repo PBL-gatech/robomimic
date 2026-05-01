@@ -38,16 +38,22 @@ def algo_config_to_class(algo_config):
     gaussian_enabled = ("gaussian" in algo_config and algo_config.gaussian.enabled)
     gmm_enabled = ("gmm" in algo_config and algo_config.gmm.enabled)
     vae_enabled = ("vae" in algo_config and algo_config.vae.enabled)
-    gated_action_enabled = ("gated_action" in algo_config and algo_config.gated_action.enabled)
+    action_head_type = algo_config.action_head.type if ("action_head" in algo_config) else "continuous"
+    mixed_action_enabled = (action_head_type == "mixed")
 
     rnn_enabled = algo_config.rnn.enabled
     # support legacy configs that do not have "transformer" item
     transformer_enabled = ("transformer" in algo_config) and algo_config.transformer.enabled
 
-    if gated_action_enabled:
-        if gaussian_enabled or gmm_enabled or vae_enabled or transformer_enabled or not rnn_enabled:
-            raise NotImplementedError("gated_action is only implemented for deterministic BC-RNN")
-        algo_class, algo_kwargs = BC_RNN_GatedAction, {}
+    if mixed_action_enabled:
+        if gaussian_enabled or gmm_enabled or vae_enabled or transformer_enabled:
+            raise NotImplementedError("action_head.type='mixed' is only implemented for deterministic BC and BC-RNN")
+        if rnn_enabled:
+            algo_class, algo_kwargs = BC_RNN_MixedAction, {}
+        else:
+            algo_class, algo_kwargs = BC_MixedAction, {}
+    elif action_head_type != "continuous":
+        raise ValueError("unsupported BC action_head.type '{}'".format(action_head_type))
     elif gaussian_enabled:
         if rnn_enabled:
             raise NotImplementedError
@@ -254,6 +260,263 @@ class BC(PolicyAlgo):
         """
         assert not self.nets.training
         return self.nets["policy"](obs_dict, goal_dict=goal_dict)
+
+
+class MixedActionBCMixin(object):
+    """
+    Shared helpers for deterministic BC variants with mixed continuous and binary
+    action heads.
+    """
+    def _setup_mixed_action_config(self):
+        cfg = self.algo_config.action_head
+        self._continuous_indices = [int(i) for i in cfg.continuous_indices]
+        self._binary_indices = [int(i) for i in cfg.binary_indices]
+        self._gate_enabled = bool(cfg.gate.enabled)
+        self._gate_threshold = float(cfg.gate.threshold)
+        self._binary_mode = str(cfg.noop.binary_mode)
+
+        if cfg.type != "mixed":
+            raise ValueError("Mixed action BC requires algo.action_head.type='mixed'")
+        if self._binary_mode != "repeat_last":
+            raise NotImplementedError("only action_head.noop.binary_mode='repeat_last' is supported")
+
+        all_indices = self._continuous_indices + self._binary_indices
+        if len(all_indices) != len(set(all_indices)):
+            raise ValueError("mixed action continuous_indices and binary_indices must not overlap")
+        if sorted(all_indices) != list(range(self.ac_dim)):
+            raise ValueError(
+                "mixed action indices must cover every action dimension exactly once; "
+                "got continuous_indices={} binary_indices={} for ac_dim={}".format(
+                    self._continuous_indices, self._binary_indices, self.ac_dim)
+            )
+
+        self._noop_continuous_raw_values = torch.as_tensor(
+            list(cfg.noop.continuous_raw_values), dtype=torch.float32, device=self.device)
+        if self._noop_continuous_raw_values.numel() != len(self._continuous_indices):
+            raise ValueError("action_head.noop.continuous_raw_values must match continuous_indices length")
+
+        self._initial_binary_values = torch.as_tensor(
+            list(cfg.noop.initial_binary_values), dtype=torch.float32, device=self.device)
+        if self._initial_binary_values.numel() != len(self._binary_indices):
+            raise ValueError("action_head.noop.initial_binary_values must match binary_indices length")
+
+        self._last_raw_binary = None
+        self._action_norm_offset = None
+        self._action_norm_scale = None
+
+    def set_action_normalization_stats(self, action_normalization_stats):
+        action_key = self.global_config.train.action_keys[0]
+        stats = action_normalization_stats[action_key]
+        self._action_norm_offset = torch.as_tensor(
+            stats["offset"], dtype=torch.float32, device=self.device).reshape(-1)
+        self._action_norm_scale = torch.as_tensor(
+            stats["scale"], dtype=torch.float32, device=self.device).reshape(-1)
+
+    def _add_mixed_action_batch_fields(self, input_batch, batch, take_first_step):
+        if take_first_step:
+            input_batch["event_label"] = batch["event_label"][:, 0, :]
+            input_batch["event_weight"] = batch["event_weight"][:, 0, :]
+            input_batch["pad_mask"] = batch["pad_mask"][:, 0, :]
+            input_batch["binary_labels"] = batch["binary_labels"][:, 0, :]
+        else:
+            input_batch["event_label"] = batch["event_label"]
+            input_batch["event_weight"] = batch["event_weight"]
+            input_batch["pad_mask"] = batch["pad_mask"]
+            input_batch["binary_labels"] = batch["binary_labels"]
+        return input_batch
+
+    def _forward_training(self, batch):
+        return self.nets["policy"](obs_dict=batch["obs"], goal_dict=batch["goal_obs"])
+
+    def _weighted_mean(self, loss, weight):
+        weight = weight.to(dtype=loss.dtype)
+        return (loss * weight).sum() / weight.sum().clamp(min=1e-6)
+
+    def _compute_losses(self, predictions, batch):
+        losses = OrderedDict()
+
+        event_label = batch["event_label"].squeeze(-1)
+        event_weight = batch["event_weight"].squeeze(-1)
+        pad_mask = batch["pad_mask"].squeeze(-1).to(dtype=event_label.dtype)
+        sample_weight = event_weight * pad_mask
+        value_mask = sample_weight * event_label if self._gate_enabled else sample_weight
+
+        continuous_target = batch["actions"][..., self._continuous_indices]
+        binary_target = batch["binary_labels"]
+
+        if self._gate_enabled:
+            gate_loss = F.binary_cross_entropy_with_logits(
+                predictions["gate_logits"], event_label, reduction="none")
+            losses["gate_loss"] = self._weighted_mean(gate_loss, sample_weight)
+            losses["gate_positive_rate"] = torch.sigmoid(predictions["gate_logits"]).mean()
+
+            if not self.nets.training:
+                valid_mask = pad_mask > 0
+                with torch.no_grad():
+                    pred_positive = torch.sigmoid(predictions["gate_logits"]) > self._gate_threshold
+                    true_positive_label = event_label > 0.5
+                    tp = (pred_positive & true_positive_label & valid_mask).sum().to(dtype=torch.float32)
+                    fp = (pred_positive & ~true_positive_label & valid_mask).sum().to(dtype=torch.float32)
+                    fn = (~pred_positive & true_positive_label & valid_mask).sum().to(dtype=torch.float32)
+                    pred_count = tp + fp
+                    true_count = tp + fn
+                    valid_count = valid_mask.sum().to(dtype=torch.float32)
+                    precision = tp / pred_count.clamp(min=1.0)
+                    recall = tp / true_count.clamp(min=1.0)
+                    f1 = (2.0 * precision * recall) / (precision + recall).clamp(min=1e-6)
+                    losses["gate_precision"] = precision
+                    losses["gate_recall"] = recall
+                    losses["gate_f1"] = f1
+                    losses["gate_true_rate"] = true_count / valid_count.clamp(min=1.0)
+                    losses["gate_pred_rate"] = pred_count / valid_count.clamp(min=1.0)
+                    losses["gate_tp"] = tp
+                    losses["gate_fp"] = fp
+                    losses["gate_fn"] = fn
+                    losses["gate_pred_count"] = pred_count
+                    losses["gate_true_count"] = true_count
+                    losses["gate_valid_count"] = valid_count
+        else:
+            losses["gate_loss"] = sample_weight.sum() * 0.0
+            losses["gate_positive_rate"] = sample_weight.sum() * 0.0
+            if not self.nets.training:
+                zero = sample_weight.sum() * 0.0
+                losses["gate_precision"] = zero
+                losses["gate_recall"] = zero
+                losses["gate_f1"] = zero
+                losses["gate_true_rate"] = zero
+                losses["gate_pred_rate"] = zero
+                losses["gate_tp"] = zero
+                losses["gate_fp"] = zero
+                losses["gate_fn"] = zero
+                losses["gate_pred_count"] = zero
+                losses["gate_true_count"] = zero
+                losses["gate_valid_count"] = zero
+
+        continuous_loss = F.smooth_l1_loss(
+            predictions["continuous"], continuous_target, reduction="none")
+        binary_loss = F.binary_cross_entropy_with_logits(
+            predictions["binary_logits"], binary_target, reduction="none")
+
+        losses["continuous_loss"] = self._weighted_mean(continuous_loss, value_mask.unsqueeze(-1))
+        losses["binary_loss"] = self._weighted_mean(binary_loss, value_mask.unsqueeze(-1))
+        losses["event_rate"] = self._weighted_mean(event_label, pad_mask)
+
+        loss_weights = self.algo_config.action_head.loss_weights
+        losses["action_loss"] = (
+            loss_weights.gate * losses["gate_loss"] +
+            loss_weights.continuous * losses["continuous_loss"] +
+            loss_weights.binary * losses["binary_loss"]
+        )
+        return losses
+
+    def _normalize_raw_dims(self, dims, raw_values):
+        if self._action_norm_offset is None or self._action_norm_scale is None:
+            return raw_values
+        dims = torch.as_tensor(dims, dtype=torch.long, device=self.device)
+        return (raw_values - self._action_norm_offset[dims]) / self._action_norm_scale[dims]
+
+    def _ensure_mixed_rollout_state(self, batch_size):
+        if len(self._binary_indices) == 0:
+            return
+        if self._last_raw_binary is None or self._last_raw_binary.shape[0] != batch_size:
+            self._last_raw_binary = self._initial_binary_values.unsqueeze(0).expand(batch_size, -1).clone()
+
+    def _mixed_predictions_to_action(self, predictions):
+        batch_size = predictions["continuous"].shape[0]
+        self._ensure_mixed_rollout_state(batch_size=batch_size)
+
+        if self._gate_enabled:
+            should_act = torch.sigmoid(predictions["gate_logits"]) > self._gate_threshold
+        else:
+            should_act = torch.ones((batch_size,), dtype=torch.bool, device=self.device)
+
+        actions = torch.zeros((batch_size, self.ac_dim), dtype=torch.float32, device=self.device)
+
+        if len(self._continuous_indices) > 0:
+            noop_continuous = self._noop_continuous_raw_values.unsqueeze(0).expand(batch_size, -1)
+            normalized_noop = self._normalize_raw_dims(self._continuous_indices, noop_continuous)
+            actions[:, self._continuous_indices] = torch.where(
+                should_act.unsqueeze(-1),
+                predictions["continuous"],
+                normalized_noop,
+            )
+
+        if len(self._binary_indices) > 0:
+            predicted_raw_binary = (torch.sigmoid(predictions["binary_logits"]) > 0.5).to(dtype=torch.float32)
+            next_raw_binary = torch.where(
+                should_act.unsqueeze(-1),
+                predicted_raw_binary,
+                self._last_raw_binary,
+            )
+            actions[:, self._binary_indices] = self._normalize_raw_dims(self._binary_indices, next_raw_binary)
+            self._last_raw_binary = next_raw_binary.detach()
+
+        return actions
+
+    def get_action(self, obs_dict, goal_dict=None):
+        assert not self.nets.training
+        predictions = self.nets["policy"](obs_dict, goal_dict=goal_dict)
+        return self._mixed_predictions_to_action(predictions)
+
+    def reset(self):
+        self._last_raw_binary = None
+
+    def log_info(self, info):
+        log = PolicyAlgo.log_info(self, info)
+        log["Loss"] = info["losses"]["action_loss"].item()
+        log["Gate_Loss"] = info["losses"]["gate_loss"].item()
+        log["Continuous_Loss"] = info["losses"]["continuous_loss"].item()
+        log["Binary_Loss"] = info["losses"]["binary_loss"].item()
+        log["Event_Rate"] = info["losses"]["event_rate"].item()
+        log["Gate_Positive_Rate"] = info["losses"]["gate_positive_rate"].item()
+        if "gate_true_rate" in info["losses"]:
+            log["Gate_True_Rate"] = info["losses"]["gate_true_rate"].item()
+        if "gate_pred_rate" in info["losses"]:
+            log["Gate_Pred_Rate"] = info["losses"]["gate_pred_rate"].item()
+        if "gate_precision" in info["losses"]:
+            log["Gate_Precision"] = info["losses"]["gate_precision"].item()
+        if "gate_recall" in info["losses"]:
+            log["Gate_Recall"] = info["losses"]["gate_recall"].item()
+        if "gate_f1" in info["losses"]:
+            log["Gate_F1"] = info["losses"]["gate_f1"].item()
+        for loss_key, log_key in (
+            ("gate_tp", "Gate_TP"),
+            ("gate_fp", "Gate_FP"),
+            ("gate_fn", "Gate_FN"),
+            ("gate_pred_count", "Gate_Pred_Count"),
+            ("gate_true_count", "Gate_True_Count"),
+            ("gate_valid_count", "Gate_Valid_Count"),
+        ):
+            if loss_key in info["losses"]:
+                log[log_key] = info["losses"][loss_key].item()
+        if "policy_grad_norms" in info:
+            log["Policy_Grad_Norms"] = info["policy_grad_norms"]
+        return log
+
+
+class BC_MixedAction(MixedActionBCMixin, BC):
+    """
+    Deterministic BC with separate continuous, binary, and optional gate heads.
+    """
+    def _create_networks(self):
+        self._setup_mixed_action_config()
+        self.nets = nn.ModuleDict()
+        self.nets["policy"] = PolicyNets.MixedActorNetwork(
+            obs_shapes=self.obs_shapes,
+            goal_shapes=self.goal_shapes,
+            ac_dim=self.ac_dim,
+            mlp_layer_dims=self.algo_config.actor_layer_dims,
+            continuous_dim=len(self._continuous_indices),
+            binary_dim=len(self._binary_indices),
+            gate_enabled=self._gate_enabled,
+            encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+        )
+        self.nets = self.nets.float().to(self.device)
+
+    def process_batch_for_training(self, batch):
+        input_batch = super(BC_MixedAction, self).process_batch_for_training(batch)
+        input_batch = self._add_mixed_action_batch_fields(input_batch, batch, take_first_step=True)
+        return TensorUtils.to_float(TensorUtils.to_device(input_batch, self.device))
 
 
 class BC_Gaussian(BC):
@@ -580,17 +843,21 @@ class BC_RNN(BC):
         self._rnn_counter = 0
 
 
-class BC_RNN_GatedAction(BC_RNN):
+class BC_RNN_MixedAction(MixedActionBCMixin, BC_RNN):
     """
-    BC-RNN with separate intervention, continuous-command, and binary-state heads.
+    BC-RNN with separate continuous, binary, and optional gate heads.
     """
     def _create_networks(self):
+        self._setup_mixed_action_config()
         self.nets = nn.ModuleDict()
-        self.nets["policy"] = PolicyNets.RNNGatedActionNetwork(
+        self.nets["policy"] = PolicyNets.RNNMixedActorNetwork(
             obs_shapes=self.obs_shapes,
             goal_shapes=self.goal_shapes,
             ac_dim=self.ac_dim,
             mlp_layer_dims=self.algo_config.actor_layer_dims,
+            continuous_dim=len(self._continuous_indices),
+            binary_dim=len(self._binary_indices),
+            gate_enabled=self._gate_enabled,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
             **BaseNets.rnn_args_from_config(self.algo_config.rnn),
         )
@@ -600,76 +867,13 @@ class BC_RNN_GatedAction(BC_RNN):
         self._rnn_counter = 0
         self._rnn_is_open_loop = self.algo_config.rnn.get("open_loop", False)
         self._open_loop_obs = None
-        self._last_raw_binary = None
-        self._action_norm_offset = None
-        self._action_norm_scale = None
 
         self.nets = self.nets.float().to(self.device)
 
-    def set_action_normalization_stats(self, action_normalization_stats):
-        action_key = self.global_config.train.action_keys[0]
-        stats = action_normalization_stats[action_key]
-        offset = torch.as_tensor(stats["offset"], dtype=torch.float32, device=self.device).reshape(-1)
-        scale = torch.as_tensor(stats["scale"], dtype=torch.float32, device=self.device).reshape(-1)
-        self._action_norm_offset = offset
-        self._action_norm_scale = scale
-
     def process_batch_for_training(self, batch):
-        input_batch = super(BC_RNN_GatedAction, self).process_batch_for_training(batch)
-        input_batch["event_label"] = batch["event_label"]
-        input_batch["event_weight"] = batch["event_weight"]
-        input_batch["pad_mask"] = batch["pad_mask"]
-        input_batch["binary_label"] = batch["binary_label"]
+        input_batch = super(BC_RNN_MixedAction, self).process_batch_for_training(batch)
+        input_batch = self._add_mixed_action_batch_fields(input_batch, batch, take_first_step=False)
         return TensorUtils.to_float(TensorUtils.to_device(input_batch, self.device))
-
-    def _forward_training(self, batch):
-        return self.nets["policy"](obs_dict=batch["obs"], goal_dict=batch["goal_obs"])
-
-    def _weighted_mean(self, loss, weight):
-        weight = weight.to(dtype=loss.dtype)
-        return (loss * weight).sum() / weight.sum().clamp(min=1e-6)
-
-    def _compute_losses(self, predictions, batch):
-        losses = OrderedDict()
-        cfg = self.algo_config.gated_action
-        continuous_index = cfg.continuous_index
-
-        event_label = batch["event_label"].squeeze(-1)
-        event_weight = batch["event_weight"].squeeze(-1)
-        pad_mask = batch["pad_mask"].squeeze(-1).to(dtype=event_label.dtype)
-        binary_label = batch["binary_label"].squeeze(-1)
-        continuous_target = batch["actions"][..., continuous_index]
-
-        sample_weight = event_weight * pad_mask
-        event_sample_weight = sample_weight * event_label
-
-        act_loss = F.binary_cross_entropy_with_logits(
-            predictions["act_logits"], event_label, reduction="none")
-        continuous_loss = F.smooth_l1_loss(
-            predictions["continuous"], continuous_target, reduction="none")
-        binary_loss = F.binary_cross_entropy_with_logits(
-            predictions["binary_logits"], binary_label, reduction="none")
-
-        losses["act_loss"] = self._weighted_mean(act_loss, sample_weight)
-        losses["continuous_loss"] = self._weighted_mean(continuous_loss, event_sample_weight)
-        losses["binary_loss"] = self._weighted_mean(binary_loss, event_sample_weight)
-
-        losses["action_loss"] = (
-            cfg.loss_weights.act * losses["act_loss"] +
-            cfg.loss_weights.continuous * losses["continuous_loss"] +
-            cfg.loss_weights.binary * losses["binary_loss"]
-        )
-        return losses
-
-    def _normalize_raw_dim(self, dim, raw_value):
-        if self._action_norm_offset is None or self._action_norm_scale is None:
-            return raw_value
-        return (raw_value - self._action_norm_offset[dim]) / self._action_norm_scale[dim]
-
-    def _ensure_rollout_state(self, batch_size):
-        if self._last_raw_binary is None or self._last_raw_binary.shape[0] != batch_size:
-            initial_binary = float(self.algo_config.gated_action.initial_binary)
-            self._last_raw_binary = torch.full((batch_size,), initial_binary, dtype=torch.float32, device=self.device)
 
     def get_action(self, obs_dict, goal_dict=None):
         assert not self.nets.training
@@ -677,7 +881,7 @@ class BC_RNN_GatedAction(BC_RNN):
         if self._rnn_hidden_state is None or self._rnn_counter % self._rnn_horizon == 0:
             batch_size = list(obs_dict.values())[0].shape[0]
             self._rnn_hidden_state = self.nets["policy"].get_rnn_init_state(batch_size=batch_size, device=self.device)
-            self._ensure_rollout_state(batch_size=batch_size)
+            self._ensure_mixed_rollout_state(batch_size=batch_size)
 
             if self._rnn_is_open_loop:
                 self._open_loop_obs = TensorUtils.clone(TensorUtils.detach(obs_dict))
@@ -690,41 +894,11 @@ class BC_RNN_GatedAction(BC_RNN):
         predictions, self._rnn_hidden_state = self.nets["policy"].forward_step(
             obs_to_use, goal_dict=goal_dict, rnn_state=self._rnn_hidden_state)
 
-        cfg = self.algo_config.gated_action
-        continuous_index = cfg.continuous_index
-        binary_index = cfg.binary_index
-        batch_size = predictions["act_logits"].shape[0]
-        self._ensure_rollout_state(batch_size=batch_size)
-
-        should_act = torch.sigmoid(predictions["act_logits"]) > cfg.act_threshold
-        predicted_raw_binary = (torch.sigmoid(predictions["binary_logits"]) > 0.5).to(dtype=torch.float32)
-        next_raw_binary = torch.where(should_act, predicted_raw_binary, self._last_raw_binary)
-
-        actions = torch.zeros((batch_size, self.ac_dim), dtype=torch.float32, device=self.device)
-        raw_zero_continuous = torch.zeros((batch_size,), dtype=torch.float32, device=self.device)
-        actions[:, continuous_index] = torch.where(
-            should_act,
-            predictions["continuous"],
-            self._normalize_raw_dim(continuous_index, raw_zero_continuous),
-        )
-        actions[:, binary_index] = self._normalize_raw_dim(binary_index, next_raw_binary)
-
-        self._last_raw_binary = next_raw_binary.detach()
-        return actions
+        return self._mixed_predictions_to_action(predictions)
 
     def reset(self):
-        super(BC_RNN_GatedAction, self).reset()
+        BC_RNN.reset(self)
         self._last_raw_binary = None
-
-    def log_info(self, info):
-        log = PolicyAlgo.log_info(self, info)
-        log["Loss"] = info["losses"]["action_loss"].item()
-        log["Act_Loss"] = info["losses"]["act_loss"].item()
-        log["Continuous_Loss"] = info["losses"]["continuous_loss"].item()
-        log["Binary_Loss"] = info["losses"]["binary_loss"].item()
-        if "policy_grad_norms" in info:
-            log["Policy_Grad_Norms"] = info["policy_grad_norms"]
-        return log
 
 
 class BC_RNN_GMM(BC_RNN):

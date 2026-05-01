@@ -45,6 +45,7 @@ Welcome to robomimic's documentation!
    tutorials/multi_dataset_training
    tutorials/training_transformers
    tutorials/training_diffusion_policy
+   tutorials/mixed_action_bc
    tutorials/using_pretrained_models
    tutorials/observations
    tutorials/action_configs
