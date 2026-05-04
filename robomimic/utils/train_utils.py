@@ -822,33 +822,6 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
             step_log_dict[k].append(step_log_all[i][k])
     step_log_all = dict((k, float(np.mean(v))) for k, v in step_log_dict.items())
 
-    gate_count_keys = ("Gate_TP", "Gate_FP", "Gate_FN")
-    if all(k in step_log_dict for k in gate_count_keys):
-        gate_tp = float(np.sum(step_log_dict["Gate_TP"]))
-        gate_fp = float(np.sum(step_log_dict["Gate_FP"]))
-        gate_fn = float(np.sum(step_log_dict["Gate_FN"]))
-        gate_pred_count = gate_tp + gate_fp
-        gate_true_count = gate_tp + gate_fn
-
-        gate_precision = gate_tp / max(gate_pred_count, 1.0)
-        gate_recall = gate_tp / max(gate_true_count, 1.0)
-        step_log_all["Gate_Precision"] = gate_precision
-        step_log_all["Gate_Recall"] = gate_recall
-        step_log_all["Gate_F1"] = (
-            (2.0 * gate_precision * gate_recall) / max(gate_precision + gate_recall, 1e-6)
-        )
-        step_log_all["Gate_TP"] = gate_tp
-        step_log_all["Gate_FP"] = gate_fp
-        step_log_all["Gate_FN"] = gate_fn
-        step_log_all["Gate_Pred_Count"] = gate_pred_count
-        step_log_all["Gate_True_Count"] = gate_true_count
-
-        if "Gate_Valid_Count" in step_log_dict:
-            gate_valid_count = float(np.sum(step_log_dict["Gate_Valid_Count"]))
-            step_log_all["Gate_Valid_Count"] = gate_valid_count
-            step_log_all["Gate_True_Rate"] = gate_true_count / max(gate_valid_count, 1.0)
-            step_log_all["Gate_Pred_Rate"] = gate_pred_count / max(gate_valid_count, 1.0)
-
     # add in timing stats
     for k in timing_stats:
         # sum across all training steps, and convert from seconds to minutes

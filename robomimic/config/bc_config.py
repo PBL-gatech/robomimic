@@ -46,12 +46,9 @@ class BCConfig(BaseConfig):
         self.algo.action_head.type = "continuous"  # one of ["continuous", "mixed"]
         self.algo.action_head.continuous_indices = []
         self.algo.action_head.binary_indices = []
-        self.algo.action_head.gate.enabled = False
-        self.algo.action_head.gate.threshold = 0.5
         self.algo.action_head.noop.continuous_raw_values = []
         self.algo.action_head.noop.binary_mode = "repeat_last"
         self.algo.action_head.noop.initial_binary_values = []
-        self.algo.action_head.loss_weights.gate = 1.0
         self.algo.action_head.loss_weights.continuous = 1.0
         self.algo.action_head.loss_weights.binary = 1.0
 

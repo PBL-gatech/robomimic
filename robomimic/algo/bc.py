@@ -271,8 +271,6 @@ class MixedActionBCMixin(object):
         cfg = self.algo_config.action_head
         self._continuous_indices = [int(i) for i in cfg.continuous_indices]
         self._binary_indices = [int(i) for i in cfg.binary_indices]
-        self._gate_enabled = bool(cfg.gate.enabled)
-        self._gate_threshold = float(cfg.gate.threshold)
         self._binary_mode = str(cfg.noop.binary_mode)
 
         if cfg.type != "mixed":
@@ -339,58 +337,10 @@ class MixedActionBCMixin(object):
         event_weight = batch["event_weight"].squeeze(-1)
         pad_mask = batch["pad_mask"].squeeze(-1).to(dtype=event_label.dtype)
         sample_weight = event_weight * pad_mask
-        value_mask = sample_weight * event_label if self._gate_enabled else sample_weight
+        value_mask = sample_weight
 
         continuous_target = batch["actions"][..., self._continuous_indices]
         binary_target = batch["binary_labels"]
-
-        if self._gate_enabled:
-            gate_loss = F.binary_cross_entropy_with_logits(
-                predictions["gate_logits"], event_label, reduction="none")
-            losses["gate_loss"] = self._weighted_mean(gate_loss, sample_weight)
-            losses["gate_positive_rate"] = torch.sigmoid(predictions["gate_logits"]).mean()
-
-            if not self.nets.training:
-                valid_mask = pad_mask > 0
-                with torch.no_grad():
-                    pred_positive = torch.sigmoid(predictions["gate_logits"]) > self._gate_threshold
-                    true_positive_label = event_label > 0.5
-                    tp = (pred_positive & true_positive_label & valid_mask).sum().to(dtype=torch.float32)
-                    fp = (pred_positive & ~true_positive_label & valid_mask).sum().to(dtype=torch.float32)
-                    fn = (~pred_positive & true_positive_label & valid_mask).sum().to(dtype=torch.float32)
-                    pred_count = tp + fp
-                    true_count = tp + fn
-                    valid_count = valid_mask.sum().to(dtype=torch.float32)
-                    precision = tp / pred_count.clamp(min=1.0)
-                    recall = tp / true_count.clamp(min=1.0)
-                    f1 = (2.0 * precision * recall) / (precision + recall).clamp(min=1e-6)
-                    losses["gate_precision"] = precision
-                    losses["gate_recall"] = recall
-                    losses["gate_f1"] = f1
-                    losses["gate_true_rate"] = true_count / valid_count.clamp(min=1.0)
-                    losses["gate_pred_rate"] = pred_count / valid_count.clamp(min=1.0)
-                    losses["gate_tp"] = tp
-                    losses["gate_fp"] = fp
-                    losses["gate_fn"] = fn
-                    losses["gate_pred_count"] = pred_count
-                    losses["gate_true_count"] = true_count
-                    losses["gate_valid_count"] = valid_count
-        else:
-            losses["gate_loss"] = sample_weight.sum() * 0.0
-            losses["gate_positive_rate"] = sample_weight.sum() * 0.0
-            if not self.nets.training:
-                zero = sample_weight.sum() * 0.0
-                losses["gate_precision"] = zero
-                losses["gate_recall"] = zero
-                losses["gate_f1"] = zero
-                losses["gate_true_rate"] = zero
-                losses["gate_pred_rate"] = zero
-                losses["gate_tp"] = zero
-                losses["gate_fp"] = zero
-                losses["gate_fn"] = zero
-                losses["gate_pred_count"] = zero
-                losses["gate_true_count"] = zero
-                losses["gate_valid_count"] = zero
 
         continuous_loss = F.smooth_l1_loss(
             predictions["continuous"], continuous_target, reduction="none")
@@ -403,7 +353,6 @@ class MixedActionBCMixin(object):
 
         loss_weights = self.algo_config.action_head.loss_weights
         losses["action_loss"] = (
-            loss_weights.gate * losses["gate_loss"] +
             loss_weights.continuous * losses["continuous_loss"] +
             loss_weights.binary * losses["binary_loss"]
         )
@@ -425,31 +374,18 @@ class MixedActionBCMixin(object):
         batch_size = predictions["continuous"].shape[0]
         self._ensure_mixed_rollout_state(batch_size=batch_size)
 
-        if self._gate_enabled:
-            should_act = torch.sigmoid(predictions["gate_logits"]) > self._gate_threshold
-        else:
-            should_act = torch.ones((batch_size,), dtype=torch.bool, device=self.device)
-
         actions = torch.zeros((batch_size, self.ac_dim), dtype=torch.float32, device=self.device)
 
         if len(self._continuous_indices) > 0:
-            noop_continuous = self._noop_continuous_raw_values.unsqueeze(0).expand(batch_size, -1)
-            normalized_noop = self._normalize_raw_dims(self._continuous_indices, noop_continuous)
-            actions[:, self._continuous_indices] = torch.where(
-                should_act.unsqueeze(-1),
-                predictions["continuous"],
-                normalized_noop,
-            )
+            actions[:, self._continuous_indices] = predictions["continuous"]
 
         if len(self._binary_indices) > 0:
             predicted_raw_binary = (torch.sigmoid(predictions["binary_logits"]) > 0.5).to(dtype=torch.float32)
-            next_raw_binary = torch.where(
-                should_act.unsqueeze(-1),
+            actions[:, self._binary_indices] = self._normalize_raw_dims(
+                self._binary_indices,
                 predicted_raw_binary,
-                self._last_raw_binary,
             )
-            actions[:, self._binary_indices] = self._normalize_raw_dims(self._binary_indices, next_raw_binary)
-            self._last_raw_binary = next_raw_binary.detach()
+            self._last_raw_binary = predicted_raw_binary.detach()
 
         return actions
 
@@ -464,31 +400,9 @@ class MixedActionBCMixin(object):
     def log_info(self, info):
         log = PolicyAlgo.log_info(self, info)
         log["Loss"] = info["losses"]["action_loss"].item()
-        log["Gate_Loss"] = info["losses"]["gate_loss"].item()
         log["Continuous_Loss"] = info["losses"]["continuous_loss"].item()
         log["Binary_Loss"] = info["losses"]["binary_loss"].item()
         log["Event_Rate"] = info["losses"]["event_rate"].item()
-        log["Gate_Positive_Rate"] = info["losses"]["gate_positive_rate"].item()
-        if "gate_true_rate" in info["losses"]:
-            log["Gate_True_Rate"] = info["losses"]["gate_true_rate"].item()
-        if "gate_pred_rate" in info["losses"]:
-            log["Gate_Pred_Rate"] = info["losses"]["gate_pred_rate"].item()
-        if "gate_precision" in info["losses"]:
-            log["Gate_Precision"] = info["losses"]["gate_precision"].item()
-        if "gate_recall" in info["losses"]:
-            log["Gate_Recall"] = info["losses"]["gate_recall"].item()
-        if "gate_f1" in info["losses"]:
-            log["Gate_F1"] = info["losses"]["gate_f1"].item()
-        for loss_key, log_key in (
-            ("gate_tp", "Gate_TP"),
-            ("gate_fp", "Gate_FP"),
-            ("gate_fn", "Gate_FN"),
-            ("gate_pred_count", "Gate_Pred_Count"),
-            ("gate_true_count", "Gate_True_Count"),
-            ("gate_valid_count", "Gate_Valid_Count"),
-        ):
-            if loss_key in info["losses"]:
-                log[log_key] = info["losses"][loss_key].item()
         if "policy_grad_norms" in info:
             log["Policy_Grad_Norms"] = info["policy_grad_norms"]
         return log
@@ -496,7 +410,7 @@ class MixedActionBCMixin(object):
 
 class BC_MixedAction(MixedActionBCMixin, BC):
     """
-    Deterministic BC with separate continuous, binary, and optional gate heads.
+    Deterministic BC with separate continuous and binary heads.
     """
     def _create_networks(self):
         self._setup_mixed_action_config()
@@ -508,7 +422,6 @@ class BC_MixedAction(MixedActionBCMixin, BC):
             mlp_layer_dims=self.algo_config.actor_layer_dims,
             continuous_dim=len(self._continuous_indices),
             binary_dim=len(self._binary_indices),
-            gate_enabled=self._gate_enabled,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
         )
         self.nets = self.nets.float().to(self.device)
@@ -845,7 +758,7 @@ class BC_RNN(BC):
 
 class BC_RNN_MixedAction(MixedActionBCMixin, BC_RNN):
     """
-    BC-RNN with separate continuous, binary, and optional gate heads.
+    BC-RNN with separate continuous and binary heads.
     """
     def _create_networks(self):
         self._setup_mixed_action_config()
@@ -857,7 +770,6 @@ class BC_RNN_MixedAction(MixedActionBCMixin, BC_RNN):
             mlp_layer_dims=self.algo_config.actor_layer_dims,
             continuous_dim=len(self._continuous_indices),
             binary_dim=len(self._binary_indices),
-            gate_enabled=self._gate_enabled,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
             **BaseNets.rnn_args_from_config(self.algo_config.rnn),
         )

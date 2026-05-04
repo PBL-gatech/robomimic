@@ -113,8 +113,7 @@ class ActorNetwork(MIMO_MLP):
 
 class MixedActorNetwork(ActorNetwork):
     """
-    Deterministic actor network with separate continuous, binary-logit, and
-    optional intervention-gate heads.
+    Deterministic actor network with separate continuous and binary-logit heads.
     """
     def __init__(
         self,
@@ -123,13 +122,11 @@ class MixedActorNetwork(ActorNetwork):
         mlp_layer_dims,
         continuous_dim,
         binary_dim,
-        gate_enabled=False,
         goal_shapes=None,
         encoder_kwargs=None,
     ):
         self.continuous_dim = int(continuous_dim)
         self.binary_dim = int(binary_dim)
-        self.gate_enabled = bool(gate_enabled)
         super(MixedActorNetwork, self).__init__(
             obs_shapes=obs_shapes,
             ac_dim=ac_dim,
@@ -140,8 +137,6 @@ class MixedActorNetwork(ActorNetwork):
 
     def _get_output_shapes(self):
         output_shapes = OrderedDict()
-        if self.gate_enabled:
-            output_shapes["gate_logits"] = (1,)
         output_shapes["continuous"] = (self.continuous_dim,)
         output_shapes["binary_logits"] = (self.binary_dim,)
         return output_shapes
@@ -151,23 +146,19 @@ class MixedActorNetwork(ActorNetwork):
             continuous=[self.continuous_dim],
             binary_logits=[self.binary_dim],
         )
-        if self.gate_enabled:
-            output_shapes["gate_logits"] = [1]
         return output_shapes
 
     def forward(self, obs_dict, goal_dict=None):
         outputs = MIMO_MLP.forward(self, obs=obs_dict, goal=goal_dict)
         predictions = OrderedDict()
-        if self.gate_enabled:
-            predictions["gate_logits"] = outputs["gate_logits"].squeeze(-1)
         predictions["continuous"] = torch.tanh(outputs["continuous"])
         predictions["binary_logits"] = outputs["binary_logits"]
         return predictions
 
     def _to_string(self):
         """Info to pretty print."""
-        return "action_dim={}\ncontinuous_dim={}\nbinary_dim={}\ngate_enabled={}".format(
-            self.ac_dim, self.continuous_dim, self.binary_dim, self.gate_enabled)
+        return "action_dim={}\ncontinuous_dim={}\nbinary_dim={}".format(
+            self.ac_dim, self.continuous_dim, self.binary_dim)
 
 
 class PerturbationActorNetwork(ActorNetwork):
@@ -786,8 +777,7 @@ class RNNActorNetwork(RNN_MIMO_MLP):
 
 class RNNMixedActorNetwork(RNNActorNetwork):
     """
-    RNN policy network with separate continuous, binary-logit, and optional
-    intervention-gate heads.
+    RNN policy network with separate continuous and binary-logit heads.
     """
     def __init__(
         self,
@@ -798,7 +788,6 @@ class RNNMixedActorNetwork(RNNActorNetwork):
         rnn_num_layers,
         continuous_dim,
         binary_dim,
-        gate_enabled=False,
         rnn_type="LSTM",
         rnn_kwargs=None,
         goal_shapes=None,
@@ -806,7 +795,6 @@ class RNNMixedActorNetwork(RNNActorNetwork):
     ):
         self.continuous_dim = int(continuous_dim)
         self.binary_dim = int(binary_dim)
-        self.gate_enabled = bool(gate_enabled)
         super(RNNMixedActorNetwork, self).__init__(
             obs_shapes=obs_shapes,
             ac_dim=ac_dim,
@@ -821,8 +809,6 @@ class RNNMixedActorNetwork(RNNActorNetwork):
 
     def _get_output_shapes(self):
         output_shapes = OrderedDict()
-        if self.gate_enabled:
-            output_shapes["gate_logits"] = (1,)
         output_shapes["continuous"] = (self.continuous_dim,)
         output_shapes["binary_logits"] = (self.binary_dim,)
         return output_shapes
@@ -836,8 +822,6 @@ class RNNMixedActorNetwork(RNNActorNetwork):
             continuous=[T, self.continuous_dim],
             binary_logits=[T, self.binary_dim],
         )
-        if self.gate_enabled:
-            output_shapes["gate_logits"] = [T]
         return output_shapes
 
     def forward(self, obs_dict, goal_dict=None, rnn_init_state=None, return_state=False):
@@ -855,8 +839,6 @@ class RNNMixedActorNetwork(RNNActorNetwork):
             state = None
 
         predictions = OrderedDict()
-        if self.gate_enabled:
-            predictions["gate_logits"] = outputs["gate_logits"].squeeze(-1)
         predictions["continuous"] = torch.tanh(outputs["continuous"])
         predictions["binary_logits"] = outputs["binary_logits"]
 
@@ -873,8 +855,8 @@ class RNNMixedActorNetwork(RNNActorNetwork):
 
     def _to_string(self):
         """Info to pretty print."""
-        return "action_dim={}\ncontinuous_dim={}\nbinary_dim={}\ngate_enabled={}".format(
-            self.ac_dim, self.continuous_dim, self.binary_dim, self.gate_enabled)
+        return "action_dim={}\ncontinuous_dim={}\nbinary_dim={}".format(
+            self.ac_dim, self.continuous_dim, self.binary_dim)
 
 
 class RNNGMMActorNetwork(RNNActorNetwork):

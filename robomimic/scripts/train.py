@@ -24,6 +24,7 @@ import shutil
 import psutil
 import sys
 import socket
+import tempfile
 import traceback
 
 from collections import OrderedDict
@@ -141,7 +142,7 @@ def train(config, device, resume=False):
             dataset=validset,
             sampler=valid_sampler,
             batch_size=config.train.batch_size,
-            shuffle=(valid_sampler is None),
+            shuffle=False,
             num_workers=num_workers,
             drop_last=True
         )
@@ -446,7 +447,7 @@ def main(args):
         config.experiment.rollout.horizon = 10
 
         # send output to a temporary directory
-        config.train.output_dir = "/tmp/tmp_trained_models"
+        config.train.output_dir = os.path.join(tempfile.gettempdir(), "tmp_trained_models")
 
     # lock config to prevent further modifications and ensure missing keys raise errors
     config.lock()
@@ -470,7 +471,7 @@ if __name__ == "__main__":
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\NeuronHunting\bc\bc-PatcherBot_v0_041.json", # neuron hunting with lstm
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\df-PatcherBot_v0_003.json", # neuron hunting with diffusion
         # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\bc\bc-PatcherBot_v0_740.json", # pipette finding with lstm
-        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\Gigasealing\bc\bc-PatcherBot_v0_900.json",
+        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\Gigasealing\bc\bc-PatcherBot_v0_932.json",
         # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_515.json", # pipeitte finding with diffusion
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",
