@@ -12,16 +12,17 @@ from pathlib import Path
 import re
 
 
-VERSIONS = [922, 923, 924, 925, 926, 928, 929,930,931,932]  # versions to compare, e.g. [922, 923, 924, 9251]
+# VERSIONS = [925, 926,927, 928, 929,930,931,932,933,934,960,961,962,963]  # versions to compare, e.g. [922, 923, 924, 9251]
+VERSIONS = [980,981,982,983,984,985,987]  # versions to train, e.g. [942, 943, 944]
 
 # Leave empty to use the newest timestamp folder for each version.
 # Example override: {922: "20260502213703"}
 TIMESTAMPS = {}
 
-
+MODEL = "Burglary" # "Burglary" or "Gigasealing" or "PipetteFinding" or "NeuronHunting"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RUN_ROOT = REPO_ROOT / "bc_patcherBot" / "Gigasealing"
-OUTPUT_DIR = RUN_ROOT / "results" / "loss_comparison_922_925"
+RUN_ROOT = REPO_ROOT / "bc_patcherBot" / MODEL
+OUTPUT_DIR = RUN_ROOT / "results" / "loss_comparison" / MODEL
 EPOCH_RE = re.compile(r"^(Train|Validation) Epoch\s+(\d+)")
 
 
@@ -104,14 +105,51 @@ def collect_loss_metrics(all_records):
     return sorted(metrics, key=sort_key)
 
 
+def metric_value(row, metric):
+    return row.get(metric)
+
+
 def series(records, phase, metric):
-    rows = [row for row in records[phase] if metric in row]
-    epochs = [row["epoch"] for row in rows]
-    values = [row[metric] for row in rows]
+    epochs = []
+    values = []
+    for row in records[phase]:
+        value = metric_value(row, metric)
+        if value is not None:
+            epochs.append(row["epoch"])
+            values.append(value)
     return epochs, values
 
 
-def plot_phase_losses(all_records, metrics, phase, output_name):
+def plot_run_series(ax, all_records, phase, metric, plt):
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    linestyle_cycle = ["-", "--", "-.", ":"]
+    marker_cycle = ["o", "s", "^", "D", "v", "P", "X", "*"]
+
+    for run_i, (label, records) in enumerate(all_records.items()):
+        color = color_cycle[run_i % len(color_cycle)]
+        epochs, values = series(records, phase, metric)
+        if epochs:
+            marker_step = min(
+                max(len(all_records), len(epochs) // 12, 1),
+                len(epochs),
+            )
+            ax.plot(
+                epochs,
+                values,
+                color=color,
+                linewidth=1.5,
+                linestyle=linestyle_cycle[run_i % len(linestyle_cycle)],
+                marker=marker_cycle[run_i % len(marker_cycle)],
+                markersize=3.0,
+                markerfacecolor="white",
+                markeredgewidth=0.8,
+                markevery=(run_i % marker_step, marker_step),
+                alpha=0.9,
+                label=label,
+            )
+
+
+def require_matplotlib():
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -119,6 +157,11 @@ def plot_phase_losses(all_records, metrics, phase, output_name):
             "matplotlib is required for loss_comparison.py. Install it in the same "
             "environment you use for training."
         ) from exc
+    return plt
+
+
+def plot_phase_losses(all_records, metrics, phase, output_name):
+    plt = require_matplotlib()
 
     cols = 2
     rows = math.ceil(len(metrics) / cols)
@@ -128,15 +171,8 @@ def plot_phase_losses(all_records, metrics, phase, output_name):
     except AttributeError:
         axes = [axes]
 
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-
     for ax, metric in zip(axes, metrics):
-        for run_i, (label, records) in enumerate(all_records.items()):
-            color = color_cycle[run_i % len(color_cycle)]
-            epochs, values = series(records, phase, metric)
-            if epochs:
-                ax.plot(epochs, values, color=color, linewidth=1.8, label=label)
-
+        plot_run_series(ax, all_records, phase, metric, plt)
         ax.set_title(metric.replace("_", " "))
         ax.set_xlabel("Epoch")
         ax.set_ylabel(metric)
@@ -191,7 +227,10 @@ def main():
         log_paths[label] = log_path
         all_records[label] = parse_epoch_blocks(log_path)
 
-    train_plot_path, valid_plot_path, index_path = plot_losses(all_records, log_paths)
+    train_plot_path, valid_plot_path, index_path = plot_losses(
+        all_records,
+        log_paths,
+    )
     print(f"Wrote train plot: {train_plot_path}")
     print(f"Wrote validation plot: {valid_plot_path}")
     print(f"Wrote log index: {index_path}")

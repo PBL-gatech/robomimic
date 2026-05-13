@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,11 +24,16 @@ FFT_BAND_RATIOS = [
 
 
 def _sorted_action_columns(df: pd.DataFrame, prefix: str) -> List[str]:
-    cols = [col for col in df.columns if col.startswith(prefix)]
-    try:
-        return sorted(cols, key=lambda name: int(name.split("_")[1]))
-    except (IndexError, ValueError):
-        return sorted(cols)
+    indexed_cols = []
+    for col in df.columns:
+        if not col.startswith(prefix):
+            continue
+        suffix = col[len(prefix):]
+        try:
+            indexed_cols.append((int(suffix), col))
+        except ValueError:
+            continue
+    return [col for _, col in sorted(indexed_cols)]
 
 
 def default_plot_paths_for_csv(csv_path: str, plot_dir: str) -> Tuple[Path, Path]:
@@ -37,6 +44,307 @@ def default_plot_paths_for_csv(csv_path: str, plot_dir: str) -> Tuple[Path, Path
         plot_root / f"predictions_{ckpt_stem}.png",
         plot_root / f"fft_{ckpt_stem}.png",
     )
+
+
+def _safe_ratio(numerator: float, denominator: float) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _run_lengths(mask: np.ndarray) -> List[int]:
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    lengths: List[int] = []
+    current = 0
+    for value in values:
+        if value:
+            current += 1
+        elif current:
+            lengths.append(current)
+            current = 0
+    if current:
+        lengths.append(current)
+    return lengths
+
+
+def _is_binary_like(*arrays: np.ndarray) -> bool:
+    finite_values = []
+    for array in arrays:
+        values = np.asarray(array, dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size:
+            finite_values.append(values)
+    if not finite_values:
+        return False
+    values = np.concatenate(finite_values)
+    return bool(np.all(np.isclose(values, 0.0, atol=1e-6) | np.isclose(values, 1.0, atol=1e-6)))
+
+
+def _transition_indices(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=bool).reshape(-1)
+    if arr.size < 2:
+        return np.asarray([], dtype=int)
+    return np.flatnonzero(arr[1:] != arr[:-1]) + 1
+
+
+def _nearest_transition_error(gt_edges: np.ndarray, pred_edges: np.ndarray) -> Optional[float]:
+    if gt_edges.size == 0 or pred_edges.size == 0:
+        return None
+    errors = [float(np.min(np.abs(pred_edges - edge))) for edge in gt_edges]
+    return float(np.mean(errors)) if errors else None
+
+
+def _series_metrics(
+    *,
+    source_csv: str,
+    csv_path: str,
+    checkpoint: str,
+    demo_key: Any,
+    demo_id: Any,
+    dim_idx: int,
+    gt_values: np.ndarray,
+    pred_values: np.ndarray,
+) -> Dict[str, Any]:
+    gt = np.asarray(gt_values, dtype=np.float64).reshape(-1)
+    pred = np.asarray(pred_values, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(gt) & np.isfinite(pred)
+    gt = gt[valid]
+    pred = pred[valid]
+
+    row: Dict[str, Any] = {
+        "source_csv": source_csv,
+        "csv_path": csv_path,
+        "checkpoint": checkpoint,
+        "demo_key": "" if pd.isna(demo_key) else demo_key,
+        "demo_id": "" if pd.isna(demo_id) else demo_id,
+        "dim": int(dim_idx),
+        "n": int(gt.size),
+    }
+    if gt.size == 0:
+        return row
+
+    diff = pred - gt
+    abs_err = np.abs(diff)
+    row.update(
+        {
+            "mae": float(np.mean(abs_err)),
+            "mse": float(np.mean(np.square(diff))),
+            "rmse": float(np.sqrt(np.mean(np.square(diff)))),
+            "median_abs_err": float(np.median(abs_err)),
+            "p95_abs_err": float(np.percentile(abs_err, 95)),
+            "max_abs_err": float(np.max(abs_err)),
+            "mean_signed_err": float(np.mean(diff)),
+            "binary_like": False,
+        }
+    )
+
+    if not _is_binary_like(gt, pred):
+        return row
+
+    gt_pos = gt >= 0.5
+    pred_pos = pred >= 0.5
+    tp = int(np.sum(gt_pos & pred_pos))
+    tn = int(np.sum(~gt_pos & ~pred_pos))
+    fp = int(np.sum(~gt_pos & pred_pos))
+    fn = int(np.sum(gt_pos & ~pred_pos))
+    total = tp + tn + fp + fn
+    fp_runs = _run_lengths(~gt_pos & pred_pos)
+    fn_runs = _run_lengths(gt_pos & ~pred_pos)
+    gt_edges = _transition_indices(gt_pos)
+    pred_edges = _transition_indices(pred_pos)
+
+    row.update(
+        {
+            "binary_like": True,
+            "tn": tn,
+            "fp": fp,
+            "fn": fn,
+            "tp": tp,
+            "accuracy": _safe_ratio(tp + tn, total),
+            "precision": _safe_ratio(tp, tp + fp),
+            "recall": _safe_ratio(tp, tp + fn),
+            "f1": _safe_ratio(2 * tp, 2 * tp + fp + fn),
+            "specificity": _safe_ratio(tn, tn + fp),
+            "fpr": _safe_ratio(fp, fp + tn),
+            "fnr": _safe_ratio(fn, fn + tp),
+            "gt_pos_rate": _safe_ratio(tp + fn, total),
+            "pred_pos_rate": _safe_ratio(tp + fp, total),
+            "fp_burst_count": len(fp_runs),
+            "fp_burst_steps": int(sum(fp_runs)),
+            "max_fp_burst_len": int(max(fp_runs)) if fp_runs else 0,
+            "mean_fp_burst_len": float(np.mean(fp_runs)) if fp_runs else 0.0,
+            "fn_burst_count": len(fn_runs),
+            "fn_burst_steps": int(sum(fn_runs)),
+            "max_fn_burst_len": int(max(fn_runs)) if fn_runs else 0,
+            "mean_fn_burst_len": float(np.mean(fn_runs)) if fn_runs else 0.0,
+            "gt_transition_count": int(gt_edges.size),
+            "pred_transition_count": int(pred_edges.size),
+            "extra_transition_count": int(max(pred_edges.size - gt_edges.size, 0)),
+            "missed_transition_count": int(max(gt_edges.size - pred_edges.size, 0)),
+            "mean_nearest_transition_error": _nearest_transition_error(gt_edges, pred_edges),
+        }
+    )
+    return row
+
+
+def _read_metric_rows(csv_paths: List[str]) -> Tuple[List[Dict[str, Any]], List[pd.DataFrame]]:
+    rows: List[Dict[str, Any]] = []
+    frames: List[pd.DataFrame] = []
+    for csv_path in csv_paths:
+        csv_file = Path(csv_path).expanduser()
+        if not csv_file.exists():
+            continue
+        df = pd.read_csv(csv_file)
+        if "checkpoint" not in df.columns:
+            df["checkpoint"] = csv_file.stem.replace("results_bc_PatcherBot_", "")
+        gt_cols = _sorted_action_columns(df, "gt_")
+        pred_cols = _sorted_action_columns(df, "pred_")
+        if not gt_cols or len(gt_cols) != len(pred_cols):
+            continue
+
+        df["_source_csv"] = csv_file.name
+        df["_csv_path"] = str(csv_file)
+        frames.append(df)
+
+        group_cols = ["checkpoint"]
+        for optional_col in ("demo_key", "demo_id"):
+            if optional_col in df.columns:
+                group_cols.append(optional_col)
+        for group_values, group_df in df.groupby(group_cols, dropna=False):
+            if not isinstance(group_values, tuple):
+                group_values = (group_values,)
+            group_info = dict(zip(group_cols, group_values))
+            for dim_idx, (gt_col, pred_col) in enumerate(zip(gt_cols, pred_cols)):
+                rows.append(
+                    _series_metrics(
+                        source_csv=csv_file.name,
+                        csv_path=str(csv_file),
+                        checkpoint=str(group_info.get("checkpoint", "")),
+                        demo_key=group_info.get("demo_key", ""),
+                        demo_id=group_info.get("demo_id", ""),
+                        dim_idx=dim_idx,
+                        gt_values=group_df[gt_col].to_numpy(),
+                        pred_values=group_df[pred_col].to_numpy(),
+                    )
+                )
+    return rows, frames
+
+
+def _checkpoint_metric_rows(frames: List[pd.DataFrame]) -> List[Dict[str, Any]]:
+    if not frames:
+        return []
+    df = pd.concat(frames, ignore_index=True)
+    gt_cols = _sorted_action_columns(df, "gt_")
+    pred_cols = _sorted_action_columns(df, "pred_")
+    rows: List[Dict[str, Any]] = []
+    for checkpoint, group_df in df.groupby("checkpoint", dropna=False):
+        for dim_idx, (gt_col, pred_col) in enumerate(zip(gt_cols, pred_cols)):
+            rows.append(
+                _series_metrics(
+                    source_csv="",
+                    csv_path="",
+                    checkpoint=str(checkpoint),
+                    demo_key="",
+                    demo_id="",
+                    dim_idx=dim_idx,
+                    gt_values=group_df[gt_col].to_numpy(),
+                    pred_values=group_df[pred_col].to_numpy(),
+                )
+            )
+    return rows
+
+
+def _plot_binary_checkpoint_metrics(metrics_df: pd.DataFrame, out_path: Path) -> Optional[Path]:
+    binary_df = metrics_df[metrics_df.get("binary_like", False) == True].copy()
+    if binary_df.empty:
+        return None
+
+    binary_df = binary_df.sort_values(["checkpoint", "dim"])
+    labels = [
+        f"{row.checkpoint} d{int(row.dim)}" if len(binary_df["dim"].unique()) > 1 else str(row.checkpoint)
+        for row in binary_df.itertuples()
+    ]
+    x = np.arange(len(binary_df))
+
+    fig_height = max(7.0, 0.28 * len(binary_df) + 5.0)
+    fig, axes = plt.subplots(2, 1, figsize=(max(12.0, 0.45 * len(binary_df)), fig_height), sharex=True)
+
+    for metric in ("fpr", "fnr", "precision", "recall", "f1"):
+        if metric in binary_df:
+            axes[0].plot(x, binary_df[metric].astype(float), marker="o", linewidth=1.6, label=metric)
+    axes[0].set_ylabel("Rate")
+    axes[0].set_ylim(-0.02, 1.02)
+    axes[0].set_title("Binary offline metrics by checkpoint")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="best", frameon=False)
+
+    width = 0.4
+    axes[1].bar(x - width / 2, binary_df["fp_burst_count"].astype(float), width=width, label="FP bursts")
+    axes[1].bar(x + width / 2, binary_df["fn_burst_count"].astype(float), width=width, label="FN bursts")
+    axes[1].set_ylabel("Burst count")
+    axes[1].grid(True, axis="y", alpha=0.3)
+    axes[1].legend(loc="best", frameon=False)
+
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, rotation=65, ha="right")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
+def generate_aggregate_metric_reports(csv_paths: List[str], plot_dir: str) -> Dict[str, Any]:
+    plot_root = Path(plot_dir).expanduser()
+    plot_root.mkdir(parents=True, exist_ok=True)
+
+    per_csv_rows, frames = _read_metric_rows(csv_paths)
+    by_checkpoint_rows = _checkpoint_metric_rows(frames)
+
+    per_csv_path = plot_root / "aggregate_offline_metrics_per_csv.csv"
+    by_checkpoint_path = plot_root / "aggregate_offline_metrics_by_checkpoint.csv"
+    summary_path = plot_root / "aggregate_offline_metrics_summary.json"
+    binary_plot_path = plot_root / "aggregate_binary_metrics_by_checkpoint.png"
+
+    per_csv_df = pd.DataFrame(per_csv_rows)
+    by_checkpoint_df = pd.DataFrame(by_checkpoint_rows)
+    per_csv_df.to_csv(per_csv_path, index=False)
+    by_checkpoint_df.to_csv(by_checkpoint_path, index=False)
+
+    binary_plot_output = None
+    if not by_checkpoint_df.empty and "binary_like" in by_checkpoint_df:
+        binary_plot_output = _plot_binary_checkpoint_metrics(by_checkpoint_df, binary_plot_path)
+
+    checkpoint_count = int(by_checkpoint_df["checkpoint"].nunique()) if "checkpoint" in by_checkpoint_df else 0
+    binary_metrics_emitted = bool(
+        not by_checkpoint_df.empty
+        and "binary_like" in by_checkpoint_df
+        and by_checkpoint_df["binary_like"].fillna(False).astype(bool).any()
+    )
+    summary = {
+        "generated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "source_csv_count": int(len([p for p in csv_paths if Path(p).expanduser().exists()])),
+        "metric_source_csv_count": int(len(frames)),
+        "checkpoint_count": checkpoint_count,
+        "per_csv_metric_rows": int(len(per_csv_df)),
+        "by_checkpoint_metric_rows": int(len(by_checkpoint_df)),
+        "binary_metrics_emitted": binary_metrics_emitted,
+        "output_files": {
+            "per_csv": str(per_csv_path),
+            "by_checkpoint": str(by_checkpoint_path),
+            "summary": str(summary_path),
+            "binary_plot": str(binary_plot_output) if binary_plot_output is not None else None,
+        },
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+
+    print(f"Saved aggregate metrics: {per_csv_path}")
+    print(f"Saved aggregate checkpoint metrics: {by_checkpoint_path}")
+    print(f"Saved aggregate summary: {summary_path}")
+    if binary_plot_output is not None:
+        print(f"Saved aggregate binary chart: {binary_plot_output}")
+    return summary
 
 
 def _generate_fft_plot(
@@ -364,6 +672,12 @@ def batch_generate_plots(csv_dir: str, plot_dir: str, generate_fft: bool = True)
                     "error": str(exc),
                 }
             )
+    successful_csvs = [result["csv_path"] for result in results if "error" not in result and result.get("csv_path")]
+    if successful_csvs:
+        try:
+            generate_aggregate_metric_reports(successful_csvs, str(plot_root))
+        except Exception as exc:
+            print(f"[ERROR] Failed to generate aggregate metrics: {exc}")
     return results
 
 
@@ -371,5 +685,6 @@ __all__ = [
     "FFT_BAND_RATIOS",
     "batch_generate_plots",
     "default_plot_paths_for_csv",
+    "generate_aggregate_metric_reports",
     "generate_prediction_plots",
 ]

@@ -188,6 +188,8 @@ def train(config, device, resume=False):
         ac_dim=shape_meta_list[0]["ac_dim"],
         device=device
     )
+    if action_normalization_stats is not None and hasattr(model, "set_action_normalization_stats"):
+        model.set_action_normalization_stats(action_normalization_stats)
 
     if resume:
         # load ckpt dict
@@ -471,7 +473,8 @@ if __name__ == "__main__":
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\NeuronHunting\bc\bc-PatcherBot_v0_041.json", # neuron hunting with lstm
         # default=r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\df-PatcherBot_v0_003.json", # neuron hunting with diffusion
         # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\bc\bc-PatcherBot_v0_740.json", # pipette finding with lstm
-        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\Gigasealing\bc\bc-PatcherBot_v0_932.json",
+        # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\Gigasealing\bc\bc-PatcherBot_v0_986.json",
+        default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\Burglary\bc\bc-PatcherBot_v0_987.json",
         # default = r"C:\Users\sa-forest\Documents\GitHub\robomimic\robomimic\exps\templates\PipetteFinding\df\df-PatcherBot_v0_515.json", # pipeitte finding with diffusion
         help="(optional) path to a config json that will be used to override the default settings. \
             If omitted, default settings are used. This is the preferred way to run experiments.",

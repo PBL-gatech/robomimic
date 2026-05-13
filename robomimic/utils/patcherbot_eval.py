@@ -546,7 +546,8 @@ def _evaluate_demo_with_context(context: Dict[str, Any], config: Any, demo_id: O
             errs.append(info["error_l2"])
             rewards.append(reward)
             acts.append(act)
-            per_step_records.append(_build_step_record(step_idx, act, gt_action, info, reward, latency_ms=latency_ms))
+            record = _build_step_record(step_idx, act, gt_action, info, reward, latency_ms=latency_ms)
+            per_step_records.append(record)
 
             losses = _compute_loss_components(algo_name, loss_cfg, act, gt_action)
             for name, value in losses.items():

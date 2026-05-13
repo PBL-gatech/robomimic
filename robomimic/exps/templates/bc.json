@@ -92,6 +92,28 @@
             "l1_weight": 0.0,
             "cos_weight": 0.0
         },
+        "action_head": {
+            "type": "continuous",
+            "continuous_indices": [],
+            "binary_indices": [],
+            "noop": {
+                "continuous_raw_values": [],
+                "binary_mode": "repeat_last",
+                "initial_binary_values": []
+            },
+            "chunk": {
+                "enabled": false,
+                "horizon": 1,
+                "temporal_ensemble": {
+                    "enabled": true,
+                    "decay": 0.01
+                }
+            },
+            "loss_weights": {
+                "continuous": 1.0,
+                "binary": 1.0
+            }
+        },
         "actor_layer_dims": [
             1024,
             1024

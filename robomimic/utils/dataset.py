@@ -700,9 +700,13 @@ class EventAwareSequenceDataset(SequenceDataset):
         continuous_indices=None,
         binary_indices=None,
         noop_continuous_raw_values=None,
+        continuous_event_mode="nonzero",
         continuous_eps=1e-6,
+        continuous_delta_eps=1.0,
         sampler_enabled=True,
         supervision_mode="sequence",
+        chunk_enabled=False,
+        chunk_horizon=1,
         **kwargs,
     ):
         self.event_halo = int(event_halo)
@@ -717,10 +721,17 @@ class EventAwareSequenceDataset(SequenceDataset):
         assert len(self.noop_continuous_raw_values) == len(self.continuous_indices), (
             "EventAwareSequenceDataset expected one no-op raw value per continuous action index"
         )
+        assert continuous_event_mode in ("nonzero", "change")
+        self.continuous_event_mode = continuous_event_mode
         self.continuous_eps = float(continuous_eps)
+        self.continuous_delta_eps = float(continuous_delta_eps)
         self.sampler_enabled = bool(sampler_enabled)
         assert supervision_mode in ("first", "sequence", "last")
         self.supervision_mode = supervision_mode
+        self.chunk_enabled = bool(chunk_enabled)
+        self.chunk_horizon = int(chunk_horizon)
+        if self.chunk_horizon < 1:
+            raise ValueError("chunk_horizon must be at least 1")
         self._event_traces = None
         self._binary_traces = None
         self._sample_weights = None
@@ -759,13 +770,22 @@ class EventAwareSequenceDataset(SequenceDataset):
 
         events = np.zeros(actions.shape[0], dtype=np.float32)
         if events.shape[0] == 0:
-            return events, np.zeros((0, len(self.binary_indices)), dtype=np.float32)
+            return (
+                events,
+                np.zeros((0, len(self.binary_indices)), dtype=np.float32),
+            )
 
-        events[0] = 1.0
         if len(self.continuous_indices) > 0:
             continuous_actions = actions[:, self.continuous_indices]
-            continuous_noops = self.noop_continuous_raw_values.reshape(1, -1)
-            continuous_events = np.any(np.abs(continuous_actions - continuous_noops) > self.continuous_eps, axis=-1)
+            if self.continuous_event_mode == "change":
+                previous = np.concatenate(
+                    [self.noop_continuous_raw_values.reshape(1, -1), continuous_actions[:-1]], axis=0)
+                continuous_events = np.any(
+                    np.abs(continuous_actions - previous) > self.continuous_delta_eps, axis=-1)
+            else:
+                continuous_noops = self.noop_continuous_raw_values.reshape(1, -1)
+                continuous_events = np.any(
+                    np.abs(continuous_actions - continuous_noops) > self.continuous_eps, axis=-1)
             events[continuous_events] = 1.0
 
         if len(self.binary_indices) > 0:
@@ -835,6 +855,70 @@ class EventAwareSequenceDataset(SequenceDataset):
             labels = labels[:, None]
         return labels
 
+    def _sequence_values_for_indices(self, trace, indices):
+        trace_shape = trace.shape[1:] if trace.ndim > 1 else ()
+        labels = np.zeros((self.seq_length,) + trace_shape, dtype=np.float32)
+        if indices.shape[0] > 0:
+            labels[:indices.shape[0]] = trace[indices]
+        if labels.ndim == 1:
+            labels = labels[:, None]
+        return labels
+
+    def _normalize_raw_action_rows(self, raw_actions):
+        assert len(self.action_keys) == 1, "EventAwareSequenceDataset expects a single action vector key"
+        action_key = self.action_keys[0]
+        raw_actions = np.asarray(raw_actions, dtype=np.float32)
+        if raw_actions.ndim == 1:
+            raw_actions = raw_actions.reshape(-1, 1)
+        ac_dict = OrderedDict([(action_key, raw_actions)])
+        ac_dict = ObsUtils.normalize_dict(ac_dict, normalization_stats=self.get_action_normalization_stats())
+        return np.asarray(PyUtils.action_dict_to_vector(ac_dict), dtype=np.float32)
+
+    def _chunk_indices_and_mask(self, demo_id, index_in_demo):
+        demo_length = self._demo_id_to_demo_length[demo_id]
+        base_indices = index_in_demo + np.arange(self.seq_length, dtype=np.int64)[:, None]
+        offsets = np.arange(self.chunk_horizon, dtype=np.int64)[None, :]
+        chunk_indices = base_indices + offsets
+        valid_mask = (chunk_indices >= 0) & (chunk_indices < demo_length)
+        if demo_length > 0:
+            safe_indices = np.clip(chunk_indices, 0, demo_length - 1)
+        else:
+            safe_indices = np.zeros_like(chunk_indices)
+        return safe_indices.astype(np.int64), valid_mask.astype(np.float32)[..., None]
+
+    def _add_chunk_targets(self, meta, demo_id, index_in_demo):
+        chunk_indices, chunk_mask = self._chunk_indices_and_mask(demo_id, index_in_demo)
+        flat_indices = chunk_indices.reshape(-1)
+        raw_actions = self._raw_actions_for_demo(demo_id)
+        if raw_actions.ndim == 1:
+            raw_actions = raw_actions.reshape(-1, 1)
+
+        action_dim = meta["actions"].shape[-1]
+        if raw_actions.shape[0] == 0:
+            action_chunk = np.zeros((self.seq_length, self.chunk_horizon, action_dim), dtype=np.float32)
+        else:
+            raw_action_chunk = raw_actions[flat_indices]
+            normalized_actions = self._normalize_raw_action_rows(raw_action_chunk)
+            action_chunk = normalized_actions.reshape(self.seq_length, self.chunk_horizon, action_dim)
+        meta["action_chunk"] = action_chunk * chunk_mask
+
+        event_trace = self._event_traces[demo_id]
+        event_label_chunk = event_trace[flat_indices].reshape(self.seq_length, self.chunk_horizon, 1)
+        meta["event_label_chunk"] = event_label_chunk.astype(np.float32) * chunk_mask
+        meta["event_weight_chunk"] = np.ones_like(meta["event_label_chunk"], dtype=np.float32)
+        meta["pad_mask_chunk"] = chunk_mask.astype(np.float32)
+
+        binary_trace = self._binary_traces[demo_id]
+        if binary_trace.ndim == 1:
+            binary_trace = binary_trace.reshape(-1, 1)
+        binary_dim = binary_trace.shape[-1] if binary_trace.shape[0] > 0 else len(self.binary_indices)
+        if binary_trace.shape[0] == 0:
+            binary_labels_chunk = np.zeros((self.seq_length, self.chunk_horizon, binary_dim), dtype=np.float32)
+        else:
+            binary_labels_chunk = binary_trace[flat_indices].reshape(
+                self.seq_length, self.chunk_horizon, binary_dim)
+        meta["binary_labels_chunk"] = binary_labels_chunk.astype(np.float32) * chunk_mask
+
     def _build_sample_weights(self):
         buckets = np.zeros(len(self), dtype=np.int64)  # 0 background, 1 pre-event, 2 event
         for index in range(len(self)):
@@ -865,11 +949,14 @@ class EventAwareSequenceDataset(SequenceDataset):
     def get_item(self, index):
         meta = super(EventAwareSequenceDataset, self).get_item(index)
         demo_id, index_in_demo = self._index_in_demo_from_dataset_index(index)
+        valid_indices = self._valid_sequence_indices(demo_id, index_in_demo)
         event_label = self._sequence_values_for_index(self._event_traces[demo_id], demo_id, index_in_demo)
         meta["event_label"] = event_label
-        meta["binary_labels"] = self._sequence_values_for_index(self._binary_traces[demo_id], demo_id, index_in_demo)
+        meta["binary_labels"] = self._sequence_values_for_indices(self._binary_traces[demo_id], valid_indices)
         meta["event_weight"] = np.ones_like(event_label, dtype=np.float32)
         meta["pad_mask"] = self._pad_mask_for_index(demo_id, index_in_demo)
+        if self.chunk_enabled:
+            self._add_chunk_targets(meta, demo_id, index_in_demo)
         return meta
 
     def get_dataset_sampler(self):

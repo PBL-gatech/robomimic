@@ -7,11 +7,19 @@ from typing import Any, Dict, List
 try:
     from .config import Config
     from .robomimic_compat import evaluate_patcherbot_checkpoint, evaluate_patcherbot_checkpoints
-    from .visualization import default_plot_paths_for_csv, generate_prediction_plots
+    from .visualization import (
+        default_plot_paths_for_csv,
+        generate_aggregate_metric_reports,
+        generate_prediction_plots,
+    )
 except ImportError:
     from config import Config
     from robomimic_compat import evaluate_patcherbot_checkpoint, evaluate_patcherbot_checkpoints
-    from visualization import default_plot_paths_for_csv, generate_prediction_plots
+    from visualization import (
+        default_plot_paths_for_csv,
+        generate_aggregate_metric_reports,
+        generate_prediction_plots,
+    )
 
 
 class EvaluationManager:
@@ -51,3 +59,12 @@ class EvaluationManager:
         if result.get("success") and csv_path.exists():
             result["plot_paths"] = self.generate_plot_bundle(str(csv_path))
         return result
+
+    def generate_aggregate_metric_reports(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        self._sync_config()
+        csv_paths = []
+        for result in results:
+            csv_path = Path(result.get("csv_path", ""))
+            if result.get("success") and csv_path.exists():
+                csv_paths.append(str(csv_path))
+        return generate_aggregate_metric_reports(csv_paths, str(self.config.resolve_plots_dir()))

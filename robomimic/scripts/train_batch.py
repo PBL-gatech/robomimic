@@ -1,11 +1,12 @@
 """
-Hardcoded batch launcher for Gigasealing BC configs.
+Hardcoded batch launcher for PatcherBot BC and diffusion configs.
 
 Set RUN_MODE to "sequential" or "parallel", then run:
 
     py -3 robomimic/scripts/train_batch.py
 """
 
+from dataclasses import dataclass
 import json
 import multiprocessing as mp
 import os
@@ -19,7 +20,16 @@ from robomimic.scripts.train import train
 import robomimic.utils.torch_utils as TorchUtils
 
 
-VERSIONS = [929, 930, 931]
+MODEL_VERSIONS = {
+    "Burglary": {
+        "bc": [987],
+        "df": [],
+    },
+    # Backwards-compatible shorthand is still accepted:
+    # "Burglary": [981, 982],  # equivalent to {"bc": [981, 982]}
+    # "PipetteFinding": {"bc": [980]},
+    # "NeuronHunting": {"bc": [980]},
+}
 RUN_MODE = "parallel"  # "sequential" or "parallel"
 
 # Keep empty to use the experiment names from the configs, e.g. v0_923.
@@ -31,13 +41,41 @@ REQUIRE_FRESH_OUTPUT_DIRS = True
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_DIR = SCRIPT_DIR.parent / "exps" / "templates" / "Gigasealing" / "bc"
+CONFIG_ROOT = SCRIPT_DIR.parent / "exps" / "templates"
 
 
-def load_config(version):
-    config_path = CONFIG_DIR / f"bc-PatcherBot_v0_{version}.json"
+@dataclass(frozen=True)
+class TrainingJob:
+    model: str
+    model_type: str
+    version: int
+
+
+def build_jobs():
+    jobs = []
+    for model, model_jobs in MODEL_VERSIONS.items():
+        if isinstance(model_jobs, dict):
+            for model_type, versions in model_jobs.items():
+                for version in versions:
+                    jobs.append(TrainingJob(model=model, model_type=model_type, version=version))
+        else:
+            for version in model_jobs:
+                jobs.append(TrainingJob(model=model, model_type="bc", version=version))
+    return jobs
+
+
+def job_label(job):
+    return f"{job.model} {job.model_type} v0_{job.version}"
+
+
+def config_dir(job):
+    return CONFIG_ROOT / job.model / job.model_type
+
+
+def load_config(job):
+    config_path = config_dir(job) / f"{job.model_type}-PatcherBot_v0_{job.version}.json"
     if not config_path.exists():
-        raise FileNotFoundError(f"Missing config for v0_{version}: {config_path}")
+        raise FileNotFoundError(f"Missing config for {job_label(job)}: {config_path}")
 
     with config_path.open("r") as f:
         ext_cfg = json.load(f)
@@ -74,16 +112,16 @@ def restore_stdio(orig_stdout, orig_stderr):
             log_file.close()
 
 
-def run_version(version):
+def run_job(job):
     orig_stdout = sys.stdout
     orig_stderr = sys.stderr
     error = None
 
     try:
-        print(f"\n===== Training v0_{version} =====", flush=True)
-        config = load_config(version)
+        print(f"\n===== Training {job_label(job)} =====", flush=True)
+        config = load_config(job)
         device = TorchUtils.get_torch_device(try_to_use_cuda=config.train.cuda)
-        print(f"Using device for v0_{version}: {device}", flush=True)
+        print(f"Using device for {job_label(job)}: {device}", flush=True)
         train(config, device=device, resume=False)
     except Exception:
         error = traceback.format_exc()
@@ -92,24 +130,24 @@ def run_version(version):
         restore_stdio(orig_stdout, orig_stderr)
 
     if error is not None:
-        print(f"===== v0_{version} failed =====\n{error}", file=sys.stderr, flush=True)
+        print(f"===== {job_label(job)} failed =====\n{error}", file=sys.stderr, flush=True)
         return 1
 
-    print(f"===== Finished v0_{version} =====", flush=True)
+    print(f"===== Finished {job_label(job)} =====", flush=True)
     return 0
 
 
-def run_child(version):
-    sys.exit(run_version(version))
+def run_child(job):
+    sys.exit(run_job(job))
 
 
-def check_output_dirs():
+def check_output_dirs(jobs):
     existing = []
-    for version in VERSIONS:
-        config = load_config(version)
+    for job in jobs:
+        config = load_config(job)
         out_dir = experiment_dir(config)
         if out_dir.exists():
-            existing.append((version, out_dir))
+            existing.append((job, out_dir))
 
     if not existing:
         return
@@ -117,7 +155,7 @@ def check_output_dirs():
     msg = [
         "These experiment output directories already exist, so train.py would prompt for overwrite:",
     ]
-    msg.extend(f"  v0_{version}: {out_dir}" for version, out_dir in existing)
+    msg.extend(f"  {job_label(job)}: {out_dir}" for job, out_dir in existing)
     msg.extend(
         [
             "",
@@ -128,28 +166,32 @@ def check_output_dirs():
     raise RuntimeError("\n".join(msg))
 
 
-def run_sequential():
-    for version in VERSIONS:
-        status = run_version(version)
+def run_sequential(jobs):
+    for job in jobs:
+        status = run_job(job)
         if status != 0:
             return status
     return 0
 
 
-def run_parallel():
+def run_parallel(jobs):
     ctx = mp.get_context("spawn")
     processes = []
 
-    for version in VERSIONS:
-        process = ctx.Process(target=run_child, args=(version,), name=f"train-v0_{version}")
+    for job in jobs:
+        process = ctx.Process(
+            target=run_child,
+            args=(job,),
+            name=f"train-{job.model}-{job.model_type}-v0_{job.version}",
+        )
         process.start()
-        processes.append((version, process))
+        processes.append((job, process))
 
     status = 0
-    for version, process in processes:
+    for job, process in processes:
         process.join()
         if process.exitcode != 0:
-            print(f"v0_{version} exited with code {process.exitcode}", file=sys.stderr)
+            print(f"{job_label(job)} exited with code {process.exitcode}", file=sys.stderr)
             status = 1
     return status
 
@@ -158,12 +200,16 @@ def main():
     if RUN_MODE not in ("sequential", "parallel"):
         raise ValueError(f'RUN_MODE must be "sequential" or "parallel", got {RUN_MODE!r}')
 
+    jobs = build_jobs()
+    if not jobs:
+        raise ValueError("MODEL_VERSIONS must contain at least one model/version pair")
+
     if REQUIRE_FRESH_OUTPUT_DIRS:
-        check_output_dirs()
+        check_output_dirs(jobs)
 
     if RUN_MODE == "sequential":
-        return run_sequential()
-    return run_parallel()
+        return run_sequential(jobs)
+    return run_parallel(jobs)
 
 
 if __name__ == "__main__":

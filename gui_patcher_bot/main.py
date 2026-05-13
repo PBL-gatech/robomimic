@@ -67,6 +67,9 @@ class EvaluationWorker(QThread):
                 else:
                     message = f"Failed {checkpoint_name}"
                 self.progress.emit(message, int(index / total * 100))
+            aggregate_result = self.manager.generate_aggregate_metric_reports(results)
+            if aggregate_result.get("source_csv_count", 0):
+                self.progress.emit("Wrote aggregate offline metrics", 100)
             self.result.emit(results)
         except Exception as exc:
             self.error.emit(str(exc))

@@ -127,6 +127,8 @@ class MixedActorNetwork(ActorNetwork):
     ):
         self.continuous_dim = int(continuous_dim)
         self.binary_dim = int(binary_dim)
+        if self.continuous_dim == 0 and self.binary_dim == 0:
+            raise ValueError("MixedActorNetwork requires at least one continuous or binary output")
         super(MixedActorNetwork, self).__init__(
             obs_shapes=obs_shapes,
             ac_dim=ac_dim,
@@ -137,22 +139,27 @@ class MixedActorNetwork(ActorNetwork):
 
     def _get_output_shapes(self):
         output_shapes = OrderedDict()
-        output_shapes["continuous"] = (self.continuous_dim,)
-        output_shapes["binary_logits"] = (self.binary_dim,)
+        if self.continuous_dim > 0:
+            output_shapes["continuous"] = (self.continuous_dim,)
+        if self.binary_dim > 0:
+            output_shapes["binary_logits"] = (self.binary_dim,)
         return output_shapes
 
     def output_shape(self, input_shape=None):
-        output_shapes = OrderedDict(
-            continuous=[self.continuous_dim],
-            binary_logits=[self.binary_dim],
-        )
+        output_shapes = OrderedDict()
+        if self.continuous_dim > 0:
+            output_shapes["continuous"] = [self.continuous_dim]
+        if self.binary_dim > 0:
+            output_shapes["binary_logits"] = [self.binary_dim]
         return output_shapes
 
     def forward(self, obs_dict, goal_dict=None):
         outputs = MIMO_MLP.forward(self, obs=obs_dict, goal=goal_dict)
         predictions = OrderedDict()
-        predictions["continuous"] = torch.tanh(outputs["continuous"])
-        predictions["binary_logits"] = outputs["binary_logits"]
+        if self.continuous_dim > 0:
+            predictions["continuous"] = torch.tanh(outputs["continuous"])
+        if self.binary_dim > 0:
+            predictions["binary_logits"] = outputs["binary_logits"]
         return predictions
 
     def _to_string(self):
@@ -536,8 +543,8 @@ class GMMActorNetwork(ActorNetwork):
         at the last layer. Network outputs parameters of GMM distribution.
         """
         return OrderedDict(
-            mean=(self.num_modes, self.ac_dim), 
-            scale=(self.num_modes, self.ac_dim), 
+            mean=(self.num_modes, self.ac_dim),
+            scale=(self.num_modes, self.ac_dim),
             logits=(self.num_modes,),
         )
 
@@ -623,6 +630,7 @@ class RNNActorNetwork(RNN_MIMO_MLP):
         rnn_num_layers,
         rnn_type="LSTM",  # [LSTM, GRU]
         rnn_kwargs=None,
+        chunk_horizon=1,
         goal_shapes=None,
         encoder_kwargs=None,
     ):
@@ -664,6 +672,9 @@ class RNNActorNetwork(RNN_MIMO_MLP):
                     ...
         """
         self.ac_dim = ac_dim
+        self.chunk_horizon = int(getattr(self, "chunk_horizon", chunk_horizon))
+        if self.chunk_horizon < 1:
+            raise ValueError("RNNActorNetwork chunk_horizon must be at least 1")
 
         assert isinstance(obs_shapes, OrderedDict)
         self.obs_shapes = obs_shapes
@@ -702,7 +713,13 @@ class RNNActorNetwork(RNN_MIMO_MLP):
         always directly predict actions, but may instead predict the parameters
         of a action distribution.
         """
-        return OrderedDict(action=(self.ac_dim,))
+        return OrderedDict(
+            action=(
+                (self.chunk_horizon, self.ac_dim)
+                if self.chunk_horizon > 1 else
+                (self.ac_dim,)
+            )
+        )
 
     def output_shape(self, input_shape):
         # note: @input_shape should be dictionary (key: mod)
@@ -711,7 +728,11 @@ class RNNActorNetwork(RNN_MIMO_MLP):
         T = input_shape[mod][0]
         TensorUtils.assert_size_at_dim(input_shape, size=T, dim=0, 
                 msg="RNNActorNetwork: input_shape inconsistent in temporal dimension")
-        return [T, self.ac_dim]
+        return (
+            [T, self.chunk_horizon, self.ac_dim]
+            if self.chunk_horizon > 1 else
+            [T, self.ac_dim]
+        )
 
     def forward(self, obs_dict, goal_dict=None, rnn_init_state=None, return_state=False):
         """
@@ -772,7 +793,7 @@ class RNNActorNetwork(RNN_MIMO_MLP):
 
     def _to_string(self):
         """Info to pretty print."""
-        return "action_dim={}".format(self.ac_dim)
+        return "action_dim={}\nchunk_horizon={}".format(self.ac_dim, self.chunk_horizon)
 
 
 class RNNMixedActorNetwork(RNNActorNetwork):
@@ -790,11 +811,17 @@ class RNNMixedActorNetwork(RNNActorNetwork):
         binary_dim,
         rnn_type="LSTM",
         rnn_kwargs=None,
+        chunk_horizon=1,
         goal_shapes=None,
         encoder_kwargs=None,
     ):
         self.continuous_dim = int(continuous_dim)
         self.binary_dim = int(binary_dim)
+        self.chunk_horizon = int(chunk_horizon)
+        if self.chunk_horizon < 1:
+            raise ValueError("RNNMixedActorNetwork chunk_horizon must be at least 1")
+        if self.continuous_dim == 0 and self.binary_dim == 0:
+            raise ValueError("RNNMixedActorNetwork requires at least one continuous or binary output")
         super(RNNMixedActorNetwork, self).__init__(
             obs_shapes=obs_shapes,
             ac_dim=ac_dim,
@@ -809,8 +836,18 @@ class RNNMixedActorNetwork(RNNActorNetwork):
 
     def _get_output_shapes(self):
         output_shapes = OrderedDict()
-        output_shapes["continuous"] = (self.continuous_dim,)
-        output_shapes["binary_logits"] = (self.binary_dim,)
+        if self.continuous_dim > 0:
+            output_shapes["continuous"] = (
+                (self.chunk_horizon, self.continuous_dim)
+                if self.chunk_horizon > 1 else
+                (self.continuous_dim,)
+            )
+        if self.binary_dim > 0:
+            output_shapes["binary_logits"] = (
+                (self.chunk_horizon, self.binary_dim)
+                if self.chunk_horizon > 1 else
+                (self.binary_dim,)
+            )
         return output_shapes
 
     def output_shape(self, input_shape):
@@ -818,10 +855,19 @@ class RNNMixedActorNetwork(RNNActorNetwork):
         T = input_shape[mod][0]
         TensorUtils.assert_size_at_dim(input_shape, size=T, dim=0,
                 msg="RNNMixedActorNetwork: input_shape inconsistent in temporal dimension")
-        output_shapes = OrderedDict(
-            continuous=[T, self.continuous_dim],
-            binary_logits=[T, self.binary_dim],
-        )
+        output_shapes = OrderedDict()
+        if self.continuous_dim > 0:
+            output_shapes["continuous"] = (
+                [T, self.chunk_horizon, self.continuous_dim]
+                if self.chunk_horizon > 1 else
+                [T, self.continuous_dim]
+            )
+        if self.binary_dim > 0:
+            output_shapes["binary_logits"] = (
+                [T, self.chunk_horizon, self.binary_dim]
+                if self.chunk_horizon > 1 else
+                [T, self.binary_dim]
+            )
         return output_shapes
 
     def forward(self, obs_dict, goal_dict=None, rnn_init_state=None, return_state=False):
@@ -839,8 +885,10 @@ class RNNMixedActorNetwork(RNNActorNetwork):
             state = None
 
         predictions = OrderedDict()
-        predictions["continuous"] = torch.tanh(outputs["continuous"])
-        predictions["binary_logits"] = outputs["binary_logits"]
+        if self.continuous_dim > 0:
+            predictions["continuous"] = torch.tanh(outputs["continuous"])
+        if self.binary_dim > 0:
+            predictions["binary_logits"] = outputs["binary_logits"]
 
         if return_state:
             return predictions, state
@@ -855,8 +903,8 @@ class RNNMixedActorNetwork(RNNActorNetwork):
 
     def _to_string(self):
         """Info to pretty print."""
-        return "action_dim={}\ncontinuous_dim={}\nbinary_dim={}".format(
-            self.ac_dim, self.continuous_dim, self.binary_dim)
+        return "action_dim={}\ncontinuous_dim={}\nbinary_dim={}\nchunk_horizon={}".format(
+            self.ac_dim, self.continuous_dim, self.binary_dim, self.chunk_horizon)
 
 
 class RNNGMMActorNetwork(RNNActorNetwork):
@@ -877,6 +925,7 @@ class RNNGMMActorNetwork(RNNActorNetwork):
         std_activation="softplus",
         low_noise_eval=True,
         use_tanh=False,
+        chunk_horizon=1,
         goal_shapes=None,
         encoder_kwargs=None,
     ):
@@ -929,6 +978,9 @@ class RNNGMMActorNetwork(RNNActorNetwork):
         self.min_std = min_std
         self.low_noise_eval = low_noise_eval
         self.use_tanh = use_tanh
+        self.chunk_horizon = int(chunk_horizon)
+        if self.chunk_horizon < 1:
+            raise ValueError("RNNGMMActorNetwork chunk_horizon must be at least 1")
 
         # Define activations to use
         self.activations = {
@@ -957,9 +1009,21 @@ class RNNGMMActorNetwork(RNNActorNetwork):
         at the last layer. Network outputs parameters of GMM distribution.
         """
         return OrderedDict(
-            mean=(self.num_modes, self.ac_dim), 
-            scale=(self.num_modes, self.ac_dim), 
-            logits=(self.num_modes,),
+            mean=(
+                (self.chunk_horizon, self.num_modes, self.ac_dim)
+                if self.chunk_horizon > 1 else
+                (self.num_modes, self.ac_dim)
+            ),
+            scale=(
+                (self.chunk_horizon, self.num_modes, self.ac_dim)
+                if self.chunk_horizon > 1 else
+                (self.num_modes, self.ac_dim)
+            ),
+            logits=(
+                (self.chunk_horizon, self.num_modes)
+                if self.chunk_horizon > 1 else
+                (self.num_modes,)
+            ),
         )
 
     def forward_train(self, obs_dict, goal_dict=None, rnn_init_state=None, return_state=False):
@@ -1104,8 +1168,9 @@ class RNNGMMActorNetwork(RNNActorNetwork):
 
     def _to_string(self):
         """Info to pretty print."""
-        msg = "action_dim={}, std_activation={}, low_noise_eval={}, num_nodes={}, min_std={}".format(
-            self.ac_dim, self.std_activation, self.low_noise_eval, self.num_modes, self.min_std)
+        msg = "action_dim={}, std_activation={}, low_noise_eval={}, num_nodes={}, min_std={}, chunk_horizon={}".format(
+            self.ac_dim, self.std_activation, self.low_noise_eval, self.num_modes, self.min_std,
+            self.chunk_horizon)
         return msg
 
 

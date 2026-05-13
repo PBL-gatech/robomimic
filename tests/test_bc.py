@@ -6,11 +6,13 @@ to see stdout output).
 """
 import argparse
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import numpy as np
+import torch
 
-import robomimic
-from robomimic.config import Config
+import robomimic.models.policy_nets as PolicyNets
+from robomimic.algo.bc import MixedActionBCMixin
 from robomimic.utils.dataset import EventAwareSequenceDataset, action_stats_to_normalization_stats
 import robomimic.utils.test_utils as TestUtils
 from robomimic.utils.log_utils import silence_stdout
@@ -107,6 +109,240 @@ def test_mixed_binary_actions_keep_identity_normalization():
     np.testing.assert_allclose(normalized[:, 1], raw_actions[:, 1])
     assert normalized[0, 0] < -0.99
     assert normalized[1, 0] > 0.99
+
+
+def _event_dataset(actions, mode="change"):
+    dataset = object.__new__(EventAwareSequenceDataset)
+    dataset.continuous_indices = [0]
+    dataset.binary_indices = [1]
+    dataset.noop_continuous_raw_values = np.array([0.0], dtype=np.float32)
+    dataset.continuous_event_mode = mode
+    dataset.continuous_eps = 1e-6
+    dataset.continuous_delta_eps = 1.0
+    dataset._hdf5_file = None
+    dataset._raw_actions_for_demo = lambda _: np.asarray(actions, dtype=np.float32)
+    return dataset
+
+
+def test_event_sampler_change_mode_labels_setpoint_transitions():
+    events, binary = _event_dataset([
+        [50.0, 1.0],
+        [50.0, 1.0],
+        [50.5, 1.0],
+        [55.0, 1.0],
+        [55.0, 0.0],
+        [55.0, 0.0],
+    ])._traces_for_demo("demo")
+
+    np.testing.assert_array_equal(events, np.array([1, 0, 0, 1, 1, 0], dtype=np.float32))
+    np.testing.assert_array_equal(binary[:, 0], np.array([1, 1, 1, 1, 0, 0], dtype=np.float32))
+
+
+def test_event_sampler_nonzero_mode_keeps_legacy_hold_labels():
+    events, _ = _event_dataset([[50.0, 1.0], [50.0, 1.0]], mode="nonzero")._traces_for_demo("demo")
+    np.testing.assert_array_equal(events, np.array([1, 1], dtype=np.float32))
+
+
+def test_event_sampler_change_mode_weights_background_pre_event_and_event():
+    dataset = object.__new__(EventAwareSequenceDataset)
+    dataset.seq_length = 1
+    dataset.event_halo = 2
+    dataset.event_mixture = dict(background=0.1, pre_event=0.3, event=0.6)
+    dataset.supervision_mode = "first"
+    dataset.pad_frame_stack = True
+    dataset.n_frame_stack = 1
+    dataset.total_num_sequences = 6
+    dataset._hdf5_file = None
+    dataset._index_to_demo_id = ["demo"] * 6
+    dataset._demo_id_to_start_indices = {"demo": 0}
+    dataset._demo_id_to_demo_length = {"demo": 6}
+    dataset._event_traces = {"demo": np.array([0, 0, 0, 1, 0, 0], dtype=np.float32)}
+
+    buckets, weights = dataset._build_sample_weights()
+
+    np.testing.assert_array_equal(buckets, np.array([0, 1, 1, 2, 0, 0]))
+    assert weights[3] > weights[1] > weights[0]
+
+
+def _mixed_loss_subject():
+    subject = object.__new__(MixedActionBCMixin)
+    subject._continuous_indices = [0]
+    subject._binary_indices = [1]
+    subject._action_norm_scale = None
+    subject.algo_config = SimpleNamespace(action_head=SimpleNamespace(
+        loss_weights=SimpleNamespace(continuous=1.0, binary=1.0)))
+    subject.nets = SimpleNamespace(training=True)
+    return subject
+
+
+def test_mixed_action_content_losses_use_sample_weight_directly():
+    subject = _mixed_loss_subject()
+    batch = dict(
+        actions=torch.tensor([[[0.0, 1.0], [10.0, 1.0], [30.0, 0.0]]]),
+        event_label=torch.tensor([[[0.0], [1.0], [0.0]]]),
+        event_weight=torch.ones(1, 3, 1),
+        pad_mask=torch.ones(1, 3, 1),
+        binary_labels=torch.tensor([[[1.0], [1.0], [0.0]]]),
+    )
+    predictions = OrderedDict(continuous=torch.zeros(1, 3, 1), binary_logits=torch.zeros(1, 3, 1))
+
+    losses = subject._compute_losses(predictions, batch)
+
+    torch.testing.assert_close(losses["continuous_loss"], torch.tensor(13.0))
+    torch.testing.assert_close(losses["binary_loss"], torch.tensor(np.log(2.0), dtype=torch.float32))
+    torch.testing.assert_close(losses["event_rate"], torch.tensor(1.0 / 3.0))
+    assert set(losses) == {"continuous_loss", "binary_loss", "event_rate", "action_loss"}
+
+
+def test_mixed_action_rollout_uses_current_continuous_and_binary_predictions():
+    subject = object.__new__(MixedActionBCMixin)
+    subject.device = torch.device("cpu")
+    subject.ac_dim = 2
+    subject._continuous_indices = [0]
+    subject._binary_indices = [1]
+    subject._action_norm_offset = torch.tensor([50.0, 0.0])
+    subject._action_norm_scale = torch.tensor([10.0, 1.0])
+
+    first = subject._mixed_predictions_to_action(OrderedDict(
+        continuous=torch.tensor([[0.2]]),
+        binary_logits=torch.tensor([[-10.0]]),
+    ))
+    second = subject._mixed_predictions_to_action(OrderedDict(
+        continuous=torch.tensor([[-0.8]]),
+        binary_logits=torch.tensor([[10.0]]),
+    ))
+
+    torch.testing.assert_close(first, torch.tensor([[0.2, 0.0]]))
+    torch.testing.assert_close(second, torch.tensor([[-0.8, 1.0]]))
+
+
+def test_event_dataset_chunk_targets_mask_post_demo_offsets():
+    actions = np.array([
+        [0.0, 1.0],
+        [10.0, 1.0],
+        [20.0, 0.0],
+        [30.0, 1.0],
+        [40.0, 0.0],
+    ], dtype=np.float32)
+    dataset = object.__new__(EventAwareSequenceDataset)
+    dataset._hdf5_file = None
+    dataset.seq_length = 3
+    dataset.chunk_horizon = 4
+    dataset.action_keys = ("actions",)
+    dataset.binary_indices = [1]
+    dataset._demo_id_to_demo_length = {"demo": actions.shape[0]}
+    dataset._event_traces = {"demo": np.array([0, 1, 0, 1, 0], dtype=np.float32)}
+    dataset._binary_traces = {"demo": actions[:, [1]]}
+    dataset._raw_actions_for_demo = lambda _: actions
+    dataset.get_action_normalization_stats = lambda: OrderedDict(
+        actions=dict(
+            offset=np.zeros((1, 2), dtype=np.float32),
+            scale=np.ones((1, 2), dtype=np.float32),
+        )
+    )
+    meta = {"actions": np.zeros((dataset.seq_length, actions.shape[-1]), dtype=np.float32)}
+
+    dataset._add_chunk_targets(meta, "demo", index_in_demo=2)
+
+    assert meta["action_chunk"].shape == (3, 4, 2)
+    assert meta["event_label_chunk"].shape == (3, 4, 1)
+    assert meta["event_weight_chunk"].shape == (3, 4, 1)
+    assert meta["pad_mask_chunk"].shape == (3, 4, 1)
+    assert meta["binary_labels_chunk"].shape == (3, 4, 1)
+    np.testing.assert_array_equal(
+        meta["pad_mask_chunk"][:, :, 0],
+        np.array([[1, 1, 1, 0], [1, 1, 0, 0], [1, 0, 0, 0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(meta["action_chunk"][0, :3], actions[2:5])
+    np.testing.assert_array_equal(meta["action_chunk"][0, 3], np.zeros(2, dtype=np.float32))
+    np.testing.assert_array_equal(meta["binary_labels_chunk"][0, :3, 0], actions[2:5, 1])
+
+
+def test_rnn_mixed_actor_network_chunk_output_shapes(monkeypatch):
+    net = object.__new__(PolicyNets.RNNMixedActorNetwork)
+    net.obs_shapes = OrderedDict(obs=(5,))
+    net.continuous_dim = 2
+    net.binary_dim = 1
+    net.chunk_horizon = 3
+    net._is_goal_conditioned = False
+
+    decoder_shapes = net._get_output_shapes()
+
+    def fake_rnn_forward(_self, obs, goal=None, rnn_init_state=None, return_state=False):
+        outputs = OrderedDict(
+            continuous=torch.zeros(2, 4, 3, 2),
+            binary_logits=torch.zeros(2, 4, 3, 1),
+        )
+        return (outputs, None) if return_state else outputs
+
+    monkeypatch.setattr(PolicyNets.RNN_MIMO_MLP, "forward", fake_rnn_forward)
+    predictions = net.forward(OrderedDict(obs=torch.zeros(2, 4, 5)))
+
+    assert decoder_shapes["continuous"] == (3, 2)
+    assert decoder_shapes["binary_logits"] == (3, 1)
+    assert predictions["continuous"].shape == (2, 4, 3, 2)
+    assert predictions["binary_logits"].shape == (2, 4, 3, 1)
+    assert set(predictions) == {"continuous", "binary_logits"}
+
+
+def test_chunked_mixed_action_loss_uses_chunk_pad_mask():
+    subject = _mixed_loss_subject()
+    subject._chunk_enabled = True
+    subject._chunk_horizon = 2
+    batch = dict(
+        action_chunk=torch.tensor([[[[2.0, 1.0], [100.0, 1.0]], [[4.0, 0.0], [8.0, 1.0]]]]),
+        event_label_chunk=torch.ones(1, 2, 2, 1),
+        event_weight_chunk=torch.ones(1, 2, 2, 1),
+        pad_mask_chunk=torch.tensor([[[[1.0], [0.0]], [[1.0], [1.0]]]]),
+        binary_labels_chunk=torch.tensor([[[[1.0], [1.0]], [[0.0], [1.0]]]]),
+    )
+    predictions = OrderedDict(
+        continuous=torch.zeros(1, 2, 2, 1),
+        binary_logits=torch.zeros(1, 2, 2, 1),
+    )
+
+    losses = subject._compute_losses(predictions, batch)
+
+    expected_continuous = torch.tensor((1.5 + 3.5 + 7.5) / 3.0)
+    torch.testing.assert_close(losses["continuous_loss"], expected_continuous)
+    assert set(losses) == {"continuous_loss", "binary_loss", "event_rate", "action_loss"}
+
+
+def test_chunk_temporal_ensembling_and_reset_behavior():
+    subject = object.__new__(MixedActionBCMixin)
+    subject._chunk_enabled = True
+    subject._chunk_horizon = 3
+    subject._chunk_temporal_ensemble_enabled = True
+    subject._chunk_temporal_ensemble_decay = 0.0
+    subject._chunk_prediction_history = []
+    subject._chunk_rollout_batch_size = None
+
+    first = OrderedDict(
+        continuous=torch.tensor([[[0.0], [10.0], [20.0]]]),
+        binary_logits=torch.tensor([[[0.0], [2.0], [4.0]]]),
+    )
+    second = OrderedDict(
+        continuous=torch.tensor([[[100.0], [110.0], [120.0]]]),
+        binary_logits=torch.tensor([[[10.0], [12.0], [14.0]]]),
+    )
+
+    subject._aggregate_chunk_predictions(first, current_step=0)
+    ensembled = subject._aggregate_chunk_predictions(second, current_step=1)
+
+    torch.testing.assert_close(ensembled["continuous"], torch.tensor([[55.0]]))
+    torch.testing.assert_close(ensembled["binary_logits"], torch.tensor([[6.0]]))
+
+    subject._reset_chunk_rollout_state()
+    assert subject._chunk_prediction_history == []
+    assert subject._chunk_rollout_batch_size is None
+
+    batched = OrderedDict(
+        continuous=torch.zeros(2, 3, 1),
+        binary_logits=torch.zeros(2, 3, 1),
+    )
+    subject._aggregate_chunk_predictions(batched, current_step=2)
+    assert len(subject._chunk_prediction_history) == 1
+    assert subject._chunk_rollout_batch_size == 2
 
 
 def make_image_modifier(config_modifier):

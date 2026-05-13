@@ -18,7 +18,9 @@ class BCConfig(BaseConfig):
         self.train.event_sampler.mixture.event = 0.3
         self.train.event_sampler.mixture.pre_event = 0.2
         self.train.event_sampler.mixture.background = 0.5
+        self.train.event_sampler.continuous_event_mode = "nonzero"
         self.train.event_sampler.continuous_eps = 1e-6
+        self.train.event_sampler.continuous_delta_eps = 1.0
 
     def algo_config(self):
         """
@@ -49,6 +51,10 @@ class BCConfig(BaseConfig):
         self.algo.action_head.noop.continuous_raw_values = []
         self.algo.action_head.noop.binary_mode = "repeat_last"
         self.algo.action_head.noop.initial_binary_values = []
+        self.algo.action_head.chunk.enabled = False
+        self.algo.action_head.chunk.horizon = 1
+        self.algo.action_head.chunk.temporal_ensemble.enabled = True
+        self.algo.action_head.chunk.temporal_ensemble.decay = 0.01
         self.algo.action_head.loss_weights.continuous = 1.0
         self.algo.action_head.loss_weights.binary = 1.0
 

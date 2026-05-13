@@ -40,6 +40,12 @@ def algo_config_to_class(algo_config):
     vae_enabled = ("vae" in algo_config and algo_config.vae.enabled)
     action_head_type = algo_config.action_head.type if ("action_head" in algo_config) else "continuous"
     mixed_action_enabled = (action_head_type == "mixed")
+    action_head_chunk_enabled = (
+        ("action_head" in algo_config) and
+        ("chunk" in algo_config.action_head) and
+        algo_config.action_head.chunk.enabled
+    )
+    chunk_enabled = mixed_action_enabled and action_head_chunk_enabled
 
     rnn_enabled = algo_config.rnn.enabled
     # support legacy configs that do not have "transformer" item
@@ -48,12 +54,18 @@ def algo_config_to_class(algo_config):
     if mixed_action_enabled:
         if gaussian_enabled or gmm_enabled or vae_enabled or transformer_enabled:
             raise NotImplementedError("action_head.type='mixed' is only implemented for deterministic BC and BC-RNN")
+        if chunk_enabled and not rnn_enabled:
+            raise NotImplementedError("action_head.chunk is only implemented for deterministic mixed-action BC-RNN")
         if rnn_enabled:
             algo_class, algo_kwargs = BC_RNN_MixedAction, {}
         else:
             algo_class, algo_kwargs = BC_MixedAction, {}
     elif action_head_type != "continuous":
         raise ValueError("unsupported BC action_head.type '{}'".format(action_head_type))
+    elif action_head_chunk_enabled and not rnn_enabled:
+        raise NotImplementedError("action_head.chunk for continuous BC is only implemented for BC-RNN")
+    elif action_head_chunk_enabled and (gaussian_enabled or vae_enabled or transformer_enabled):
+        raise NotImplementedError("action_head.chunk for continuous BC is only implemented for deterministic BC-RNN and BC-RNN-GMM")
     elif gaussian_enabled:
         if rnn_enabled:
             raise NotImplementedError
@@ -90,6 +102,79 @@ class BC(PolicyAlgo):
     """
     Normal BC training.
     """
+    def _setup_action_chunk_config(self):
+        cfg = self.algo_config.action_head if ("action_head" in self.algo_config) else None
+        chunk_cfg = cfg.chunk if cfg is not None and ("chunk" in cfg) else None
+        self._chunk_enabled = bool(chunk_cfg.enabled) if chunk_cfg is not None else False
+        self._chunk_horizon = int(chunk_cfg.horizon) if chunk_cfg is not None else 1
+        temporal_ensemble_cfg = (
+            chunk_cfg.temporal_ensemble
+            if chunk_cfg is not None and ("temporal_ensemble" in chunk_cfg) else
+            None
+        )
+        self._chunk_temporal_ensemble_enabled = (
+            bool(temporal_ensemble_cfg.enabled) if temporal_ensemble_cfg is not None else True
+        )
+        self._chunk_temporal_ensemble_decay = (
+            float(temporal_ensemble_cfg.decay) if temporal_ensemble_cfg is not None else 0.01
+        )
+        if self._chunk_horizon < 1:
+            raise ValueError("action_head.chunk.horizon must be at least 1")
+        if self._chunk_temporal_ensemble_decay < 0.0:
+            raise ValueError("action_head.chunk.temporal_ensemble.decay must be non-negative")
+        self._reset_action_chunk_rollout_state()
+
+    def _reset_action_chunk_rollout_state(self):
+        self._action_chunk_history = []
+        self._action_chunk_rollout_batch_size = None
+
+    def _select_action_chunk_offset(self, action, offset):
+        if not getattr(self, "_chunk_enabled", False):
+            return action
+        return action[:, offset, :] if action.ndim > 2 else action
+
+    def _masked_mean(self, value, mask):
+        if mask is None:
+            return value.mean()
+        mask = mask.to(device=value.device, dtype=value.dtype)
+        while mask.ndim < value.ndim:
+            mask = mask.unsqueeze(-1)
+        return (value * mask).sum() / mask.expand_as(value).sum().clamp(min=1e-6)
+
+    def _aggregate_action_chunk(self, action, current_step):
+        if not getattr(self, "_chunk_enabled", False) or self._chunk_horizon <= 1:
+            return action
+
+        batch_size = action.shape[0]
+        if self._action_chunk_rollout_batch_size != batch_size:
+            self._reset_action_chunk_rollout_state()
+            self._action_chunk_rollout_batch_size = batch_size
+
+        if not self._chunk_temporal_ensemble_enabled:
+            return self._select_action_chunk_offset(action, offset=0)
+
+        self._action_chunk_history.append((int(current_step), action.detach()))
+        active_history = []
+        weighted_action = None
+        weight_sum = action.new_zeros(())
+        for start_step, chunk_action in self._action_chunk_history:
+            offset = int(current_step) - int(start_step)
+            if offset < 0 or offset >= self._chunk_horizon:
+                continue
+            active_history.append((start_step, chunk_action))
+            weight = torch.exp(action.new_tensor(
+                -self._chunk_temporal_ensemble_decay * float(offset)))
+            selected_action = self._select_action_chunk_offset(chunk_action, offset=offset)
+            if weighted_action is None:
+                weighted_action = selected_action.new_zeros(selected_action.shape)
+            weighted_action = weighted_action + weight * selected_action
+            weight_sum = weight_sum + weight
+
+        self._action_chunk_history = active_history
+        if weighted_action is None or weight_sum <= 0:
+            return self._select_action_chunk_offset(action, offset=0)
+        return weighted_action / weight_sum.clamp(min=1e-6)
+
     def _create_networks(self):
         """
         Creates networks and places them into @self.nets.
@@ -188,12 +273,19 @@ class BC(PolicyAlgo):
             losses (dict): dictionary of losses computed over the batch
         """
         losses = OrderedDict()
-        a_target = batch["actions"]
+        a_target = batch["action_chunk"] if getattr(self, "_chunk_enabled", False) else batch["actions"]
         actions = predictions["actions"]
-        losses["l2_loss"] = nn.MSELoss()(actions, a_target)
-        losses["l1_loss"] = nn.SmoothL1Loss()(actions, a_target)
-        # cosine direction loss on eef delta position
-        losses["cos_loss"] = LossUtils.cosine_loss(actions[..., :3], a_target[..., :3])
+        chunk_mask = batch.get("pad_mask_chunk", None) if getattr(self, "_chunk_enabled", False) else None
+        if chunk_mask is None:
+            losses["l2_loss"] = nn.MSELoss()(actions, a_target)
+            losses["l1_loss"] = nn.SmoothL1Loss()(actions, a_target)
+            # cosine direction loss on eef delta position
+            losses["cos_loss"] = LossUtils.cosine_loss(actions[..., :3], a_target[..., :3])
+        else:
+            losses["l2_loss"] = self._masked_mean(F.mse_loss(actions, a_target, reduction="none"), chunk_mask)
+            losses["l1_loss"] = self._masked_mean(F.smooth_l1_loss(actions, a_target, reduction="none"), chunk_mask)
+            cos_loss = 1.0 - F.cosine_similarity(actions[..., :3], a_target[..., :3], dim=actions.ndim - 1)
+            losses["cos_loss"] = self._masked_mean(cos_loss, chunk_mask.squeeze(-1))
 
         action_losses = [
             self.algo_config.loss.l2_weight * losses["l2_loss"],
@@ -272,9 +364,27 @@ class MixedActionBCMixin(object):
         self._continuous_indices = [int(i) for i in cfg.continuous_indices]
         self._binary_indices = [int(i) for i in cfg.binary_indices]
         self._binary_mode = str(cfg.noop.binary_mode)
+        chunk_cfg = cfg.chunk if ("chunk" in cfg) else None
+        self._chunk_enabled = bool(chunk_cfg.enabled) if chunk_cfg is not None else False
+        self._chunk_horizon = int(chunk_cfg.horizon) if chunk_cfg is not None else 1
+        temporal_ensemble_cfg = (
+            chunk_cfg.temporal_ensemble
+            if chunk_cfg is not None and ("temporal_ensemble" in chunk_cfg) else
+            None
+        )
+        self._chunk_temporal_ensemble_enabled = (
+            bool(temporal_ensemble_cfg.enabled) if temporal_ensemble_cfg is not None else True
+        )
+        self._chunk_temporal_ensemble_decay = (
+            float(temporal_ensemble_cfg.decay) if temporal_ensemble_cfg is not None else 0.01
+        )
 
         if cfg.type != "mixed":
             raise ValueError("Mixed action BC requires algo.action_head.type='mixed'")
+        if self._chunk_horizon < 1:
+            raise ValueError("action_head.chunk.horizon must be at least 1")
+        if self._chunk_temporal_ensemble_decay < 0.0:
+            raise ValueError("action_head.chunk.temporal_ensemble.decay must be non-negative")
         if self._binary_mode != "repeat_last":
             raise NotImplementedError("only action_head.noop.binary_mode='repeat_last' is supported")
 
@@ -288,19 +398,18 @@ class MixedActionBCMixin(object):
                     self._continuous_indices, self._binary_indices, self.ac_dim)
             )
 
-        self._noop_continuous_raw_values = torch.as_tensor(
-            list(cfg.noop.continuous_raw_values), dtype=torch.float32, device=self.device)
-        if self._noop_continuous_raw_values.numel() != len(self._continuous_indices):
+        noop_continuous_raw_values = list(cfg.noop.continuous_raw_values)
+        if len(noop_continuous_raw_values) != len(self._continuous_indices):
             raise ValueError("action_head.noop.continuous_raw_values must match continuous_indices length")
 
-        self._initial_binary_values = torch.as_tensor(
-            list(cfg.noop.initial_binary_values), dtype=torch.float32, device=self.device)
-        if self._initial_binary_values.numel() != len(self._binary_indices):
+        initial_binary_values = list(cfg.noop.initial_binary_values)
+        if len(initial_binary_values) != len(self._binary_indices):
             raise ValueError("action_head.noop.initial_binary_values must match binary_indices length")
 
-        self._last_raw_binary = None
         self._action_norm_offset = None
         self._action_norm_scale = None
+        self._chunk_prediction_history = []
+        self._chunk_rollout_batch_size = None
 
     def set_action_normalization_stats(self, action_normalization_stats):
         action_key = self.global_config.train.action_keys[0]
@@ -321,6 +430,12 @@ class MixedActionBCMixin(object):
             input_batch["event_weight"] = batch["event_weight"]
             input_batch["pad_mask"] = batch["pad_mask"]
             input_batch["binary_labels"] = batch["binary_labels"]
+        if getattr(self, "_chunk_enabled", False):
+            input_batch["action_chunk"] = batch["action_chunk"]
+            input_batch["event_label_chunk"] = batch["event_label_chunk"]
+            input_batch["event_weight_chunk"] = batch["event_weight_chunk"]
+            input_batch["pad_mask_chunk"] = batch["pad_mask_chunk"]
+            input_batch["binary_labels_chunk"] = batch["binary_labels_chunk"]
         return input_batch
 
     def _forward_training(self, batch):
@@ -333,22 +448,35 @@ class MixedActionBCMixin(object):
     def _compute_losses(self, predictions, batch):
         losses = OrderedDict()
 
-        event_label = batch["event_label"].squeeze(-1)
-        event_weight = batch["event_weight"].squeeze(-1)
-        pad_mask = batch["pad_mask"].squeeze(-1).to(dtype=event_label.dtype)
+        if getattr(self, "_chunk_enabled", False):
+            event_label = batch["event_label_chunk"].squeeze(-1)
+            event_weight = batch["event_weight_chunk"].squeeze(-1)
+            pad_mask = batch["pad_mask_chunk"].squeeze(-1).to(dtype=event_label.dtype)
+            action_targets = batch["action_chunk"]
+            binary_targets = batch["binary_labels_chunk"]
+        else:
+            event_label = batch["event_label"].squeeze(-1)
+            event_weight = batch["event_weight"].squeeze(-1)
+            pad_mask = batch["pad_mask"].squeeze(-1).to(dtype=event_label.dtype)
+            action_targets = batch["actions"]
+            binary_targets = batch["binary_labels"]
         sample_weight = event_weight * pad_mask
-        value_mask = sample_weight
 
-        continuous_target = batch["actions"][..., self._continuous_indices]
-        binary_target = batch["binary_labels"]
+        if len(self._continuous_indices) > 0:
+            continuous_target = action_targets[..., self._continuous_indices]
+            continuous_loss = F.smooth_l1_loss(
+                predictions["continuous"], continuous_target, reduction="none")
+            losses["continuous_loss"] = self._weighted_mean(continuous_loss, sample_weight.unsqueeze(-1))
+        else:
+            losses["continuous_loss"] = sample_weight.new_zeros(())
 
-        continuous_loss = F.smooth_l1_loss(
-            predictions["continuous"], continuous_target, reduction="none")
-        binary_loss = F.binary_cross_entropy_with_logits(
-            predictions["binary_logits"], binary_target, reduction="none")
-
-        losses["continuous_loss"] = self._weighted_mean(continuous_loss, value_mask.unsqueeze(-1))
-        losses["binary_loss"] = self._weighted_mean(binary_loss, value_mask.unsqueeze(-1))
+        if len(self._binary_indices) > 0:
+            binary_target = binary_targets
+            binary_loss = F.binary_cross_entropy_with_logits(
+                predictions["binary_logits"], binary_target, reduction="none")
+            losses["binary_loss"] = self._weighted_mean(binary_loss, sample_weight.unsqueeze(-1))
+        else:
+            losses["binary_loss"] = sample_weight.new_zeros(())
         losses["event_rate"] = self._weighted_mean(event_label, pad_mask)
 
         loss_weights = self.algo_config.action_head.loss_weights
@@ -364,30 +492,82 @@ class MixedActionBCMixin(object):
         dims = torch.as_tensor(dims, dtype=torch.long, device=self.device)
         return (raw_values - self._action_norm_offset[dims]) / self._action_norm_scale[dims]
 
-    def _ensure_mixed_rollout_state(self, batch_size):
-        if len(self._binary_indices) == 0:
-            return
-        if self._last_raw_binary is None or self._last_raw_binary.shape[0] != batch_size:
-            self._last_raw_binary = self._initial_binary_values.unsqueeze(0).expand(batch_size, -1).clone()
+    def _denormalize_dims(self, dims, values):
+        if self._action_norm_offset is None or self._action_norm_scale is None:
+            return values
+        dims = torch.as_tensor(dims, dtype=torch.long, device=self.device)
+        return values * self._action_norm_scale[dims] + self._action_norm_offset[dims]
 
     def _mixed_predictions_to_action(self, predictions):
-        batch_size = predictions["continuous"].shape[0]
-        self._ensure_mixed_rollout_state(batch_size=batch_size)
+        first_prediction = next(iter(predictions.values()))
+        batch_size = first_prediction.shape[0]
 
         actions = torch.zeros((batch_size, self.ac_dim), dtype=torch.float32, device=self.device)
 
         if len(self._continuous_indices) > 0:
-            actions[:, self._continuous_indices] = predictions["continuous"]
+            next_raw = self._denormalize_dims(self._continuous_indices, predictions["continuous"])
+            actions[:, self._continuous_indices] = self._normalize_raw_dims(self._continuous_indices, next_raw)
 
         if len(self._binary_indices) > 0:
-            predicted_raw_binary = (torch.sigmoid(predictions["binary_logits"]) > 0.5).to(dtype=torch.float32)
-            actions[:, self._binary_indices] = self._normalize_raw_dims(
-                self._binary_indices,
-                predicted_raw_binary,
-            )
-            self._last_raw_binary = predicted_raw_binary.detach()
+            next_raw_binary = (torch.sigmoid(predictions["binary_logits"]) > 0.5).to(dtype=torch.float32)
+            actions[:, self._binary_indices] = self._normalize_raw_dims(self._binary_indices, next_raw_binary)
 
         return actions
+
+    def _single_chunk_offset_prediction(self, predictions, offset):
+        if not getattr(self, "_chunk_enabled", False):
+            return predictions
+        selected = OrderedDict()
+        for key, value in predictions.items():
+            selected[key] = value[:, offset, :] if value.ndim > 2 else value
+        return selected
+
+    def _reset_chunk_rollout_state(self):
+        self._chunk_prediction_history = []
+        self._chunk_rollout_batch_size = None
+
+    def _aggregate_chunk_predictions(self, predictions, current_step):
+        if not getattr(self, "_chunk_enabled", False) or self._chunk_horizon <= 1:
+            return predictions
+
+        first_prediction = next(iter(predictions.values()))
+        batch_size = first_prediction.shape[0]
+        if self._chunk_rollout_batch_size != batch_size:
+            self._reset_chunk_rollout_state()
+            self._chunk_rollout_batch_size = batch_size
+
+        if not self._chunk_temporal_ensemble_enabled:
+            return self._single_chunk_offset_prediction(predictions, offset=0)
+
+        self._chunk_prediction_history.append((
+            int(current_step),
+            OrderedDict((key, value.detach()) for key, value in predictions.items()),
+        ))
+
+        active_history = []
+        weighted_predictions = OrderedDict()
+        weight_sum = first_prediction.new_zeros(())
+        for start_step, chunk_predictions in self._chunk_prediction_history:
+            offset = int(current_step) - int(start_step)
+            if offset < 0 or offset >= self._chunk_horizon:
+                continue
+            active_history.append((start_step, chunk_predictions))
+            weight = torch.exp(first_prediction.new_tensor(
+                -self._chunk_temporal_ensemble_decay * float(offset)))
+            selected_predictions = self._single_chunk_offset_prediction(chunk_predictions, offset=offset)
+            for key, value in selected_predictions.items():
+                if key not in weighted_predictions:
+                    weighted_predictions[key] = value.new_zeros(value.shape)
+                weighted_predictions[key] = weighted_predictions[key] + weight * value
+            weight_sum = weight_sum + weight
+
+        self._chunk_prediction_history = active_history
+        if weight_sum <= 0:
+            return self._single_chunk_offset_prediction(predictions, offset=0)
+        return OrderedDict(
+            (key, value / weight_sum.clamp(min=1e-6))
+            for key, value in weighted_predictions.items()
+        )
 
     def get_action(self, obs_dict, goal_dict=None):
         assert not self.nets.training
@@ -395,7 +575,8 @@ class MixedActionBCMixin(object):
         return self._mixed_predictions_to_action(predictions)
 
     def reset(self):
-        self._last_raw_binary = None
+        if hasattr(self, "_chunk_prediction_history"):
+            self._reset_chunk_rollout_state()
 
     def log_info(self, info):
         log = PolicyAlgo.log_info(self, info)
@@ -414,6 +595,8 @@ class BC_MixedAction(MixedActionBCMixin, BC):
     """
     def _create_networks(self):
         self._setup_mixed_action_config()
+        if self._chunk_enabled:
+            raise NotImplementedError("action_head.chunk is only implemented for deterministic mixed-action BC-RNN")
         self.nets = nn.ModuleDict()
         self.nets["policy"] = PolicyNets.MixedActorNetwork(
             obs_shapes=self.obs_shapes,
@@ -669,12 +852,14 @@ class BC_RNN(BC):
         """
         Creates networks and places them into @self.nets.
         """
+        self._setup_action_chunk_config()
         self.nets = nn.ModuleDict()
         self.nets["policy"] = PolicyNets.RNNActorNetwork(
             obs_shapes=self.obs_shapes,
             goal_shapes=self.goal_shapes,
             ac_dim=self.ac_dim,
             mlp_layer_dims=self.algo_config.actor_layer_dims,
+            chunk_horizon=self._chunk_horizon if self._chunk_enabled else 1,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
             **BaseNets.rnn_args_from_config(self.algo_config.rnn),
         )
@@ -703,6 +888,9 @@ class BC_RNN(BC):
         input_batch["obs"] = batch["obs"]
         input_batch["goal_obs"] = batch.get("goal_obs", None) # goals may not be present
         input_batch["actions"] = batch["actions"]
+        if getattr(self, "_chunk_enabled", False):
+            input_batch["action_chunk"] = batch["action_chunk"]
+            input_batch["pad_mask_chunk"] = batch["pad_mask_chunk"]
 
         if self._rnn_is_open_loop:
             # replace the observation sequence with one that only consists of the first observation.
@@ -743,10 +931,11 @@ class BC_RNN(BC):
             # replace current obs with last recorded obs
             obs_to_use = self._open_loop_obs
 
+        current_step = self._rnn_counter
         self._rnn_counter += 1
         action, self._rnn_hidden_state = self.nets["policy"].forward_step(
             obs_to_use, goal_dict=goal_dict, rnn_state=self._rnn_hidden_state)
-        return action
+        return self._aggregate_action_chunk(action, current_step=current_step)
 
     def reset(self):
         """
@@ -754,6 +943,8 @@ class BC_RNN(BC):
         """
         self._rnn_hidden_state = None
         self._rnn_counter = 0
+        if hasattr(self, "_action_chunk_history"):
+            self._reset_action_chunk_rollout_state()
 
 
 class BC_RNN_MixedAction(MixedActionBCMixin, BC_RNN):
@@ -770,6 +961,7 @@ class BC_RNN_MixedAction(MixedActionBCMixin, BC_RNN):
             mlp_layer_dims=self.algo_config.actor_layer_dims,
             continuous_dim=len(self._continuous_indices),
             binary_dim=len(self._binary_indices),
+            chunk_horizon=self._chunk_horizon if self._chunk_enabled else 1,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
             **BaseNets.rnn_args_from_config(self.algo_config.rnn),
         )
@@ -793,7 +985,6 @@ class BC_RNN_MixedAction(MixedActionBCMixin, BC_RNN):
         if self._rnn_hidden_state is None or self._rnn_counter % self._rnn_horizon == 0:
             batch_size = list(obs_dict.values())[0].shape[0]
             self._rnn_hidden_state = self.nets["policy"].get_rnn_init_state(batch_size=batch_size, device=self.device)
-            self._ensure_mixed_rollout_state(batch_size=batch_size)
 
             if self._rnn_is_open_loop:
                 self._open_loop_obs = TensorUtils.clone(TensorUtils.detach(obs_dict))
@@ -802,15 +993,17 @@ class BC_RNN_MixedAction(MixedActionBCMixin, BC_RNN):
         if self._rnn_is_open_loop:
             obs_to_use = self._open_loop_obs
 
+        current_step = self._rnn_counter
         self._rnn_counter += 1
         predictions, self._rnn_hidden_state = self.nets["policy"].forward_step(
             obs_to_use, goal_dict=goal_dict, rnn_state=self._rnn_hidden_state)
+        predictions = self._aggregate_chunk_predictions(predictions, current_step=current_step)
 
         return self._mixed_predictions_to_action(predictions)
 
     def reset(self):
         BC_RNN.reset(self)
-        self._last_raw_binary = None
+        self._reset_chunk_rollout_state()
 
 
 class BC_RNN_GMM(BC_RNN):
@@ -823,6 +1016,7 @@ class BC_RNN_GMM(BC_RNN):
         """
         assert self.algo_config.gmm.enabled
         assert self.algo_config.rnn.enabled
+        self._setup_action_chunk_config()
 
         self.nets = nn.ModuleDict()
         self.nets["policy"] = PolicyNets.RNNGMMActorNetwork(
@@ -834,6 +1028,7 @@ class BC_RNN_GMM(BC_RNN):
             min_std=self.algo_config.gmm.min_std,
             std_activation=self.algo_config.gmm.std_activation,
             low_noise_eval=self.algo_config.gmm.low_noise_eval,
+            chunk_horizon=self._chunk_horizon if self._chunk_enabled else 1,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
             **BaseNets.rnn_args_from_config(self.algo_config.rnn),
         )
@@ -862,10 +1057,12 @@ class BC_RNN_GMM(BC_RNN):
             goal_dict=batch["goal_obs"],
         )
 
-        # make sure that this is a batch of multivariate action distributions, so that
-        # the log probability computation will be correct
-        assert len(dists.batch_shape) == 2 # [B, T]
-        log_probs = dists.log_prob(batch["actions"])
+        action_targets = batch["action_chunk"] if getattr(self, "_chunk_enabled", False) else batch["actions"]
+        expected_batch_ndim = 3 if getattr(self, "_chunk_enabled", False) else 2
+        # make sure this is a batch of multivariate action distributions, so
+        # log_prob reduces only over action dimension.
+        assert len(dists.batch_shape) == expected_batch_ndim
+        log_probs = dists.log_prob(action_targets)
 
         predictions = OrderedDict(
             log_probs=log_probs,
@@ -887,7 +1084,11 @@ class BC_RNN_GMM(BC_RNN):
         """
 
         # loss is just negative log-likelihood of action targets
-        action_loss = -predictions["log_probs"].mean()
+        if getattr(self, "_chunk_enabled", False) and "pad_mask_chunk" in batch:
+            chunk_mask = batch["pad_mask_chunk"].squeeze(-1)
+            action_loss = -self._masked_mean(predictions["log_probs"], chunk_mask)
+        else:
+            action_loss = -predictions["log_probs"].mean()
         return OrderedDict(
             log_probs=-action_loss,
             action_loss=action_loss,

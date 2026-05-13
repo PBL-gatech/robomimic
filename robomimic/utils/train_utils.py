@@ -174,12 +174,19 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         ("action_head" in config.algo) and
         (config.algo.action_head.type == "mixed")
     )
+    chunk_cfg = (
+        config.algo.action_head.chunk
+        if ("action_head" in config.algo) and ("chunk" in config.algo.action_head) else
+        None
+    )
+    chunk_enabled = bool(chunk_cfg.enabled) if chunk_cfg is not None else False
+    chunk_horizon = int(chunk_cfg.horizon) if chunk_cfg is not None else 1
     is_validation_dataset = (
         filter_by_attribute is not None and
         config.train.hdf5_validation_filter_key is not None and
         filter_by_attribute == config.train.hdf5_validation_filter_key
     )
-    ds_class = EventAwareSequenceDataset if (event_sampler_enabled or mixed_action_enabled) else SequenceDataset
+    ds_class = EventAwareSequenceDataset if (event_sampler_enabled or mixed_action_enabled or chunk_enabled) else SequenceDataset
 
     ds_kwargs = dict(
         hdf5_path=dataset_path,
@@ -200,7 +207,7 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         filter_by_attribute=filter_by_attribute,
     )
 
-    if event_sampler_enabled or mixed_action_enabled:
+    if event_sampler_enabled or mixed_action_enabled or chunk_enabled:
         if event_sampler_enabled and (
             len(config.algo.action_head.continuous_indices) + len(config.algo.action_head.binary_indices) == 0
         ):
@@ -209,7 +216,7 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
                 "so event labels can be computed"
             )
 
-        if config.algo.rnn.enabled:
+        if ("rnn" in config.algo) and config.algo.rnn.enabled:
             supervision_mode = "sequence"
         elif ("transformer" in config.algo) and config.algo.transformer.enabled:
             supervision_mode = "sequence" if config.algo.transformer.supervise_all_steps else "last"
@@ -226,9 +233,13 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
             continuous_indices=list(config.algo.action_head.continuous_indices),
             binary_indices=list(config.algo.action_head.binary_indices),
             noop_continuous_raw_values=list(config.algo.action_head.noop.continuous_raw_values),
+            continuous_event_mode=config.train.event_sampler.continuous_event_mode,
             continuous_eps=config.train.event_sampler.continuous_eps,
+            continuous_delta_eps=config.train.event_sampler.continuous_delta_eps,
             sampler_enabled=(event_sampler_enabled and not is_validation_dataset),
             supervision_mode=supervision_mode,
+            chunk_enabled=chunk_enabled,
+            chunk_horizon=chunk_horizon,
         ))
 
     ds_kwargs["hdf5_path"] = [ds_cfg["path"] for ds_cfg in config.train.data]
